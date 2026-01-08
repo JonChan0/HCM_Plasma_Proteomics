@@ -1,0 +1,269 @@
+---
+title: "Transcriptomic_DEA_LimmaVoom"
+output: html_document
+date: "2025-07-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(limma)
+library(edgeR)
+library(ggrepel)
+library(RColorBrewer)
+rm(list=ls())
+```
+
+### Import Data
+
+This imports in the pseudobulked data i.e sum of all the nuclei
+
+```{r}
+chaffin22_counts <- read_csv('OUTPUT/Transcriptomic/Chaffin22/chaffin22_pseudobulk_counts.csv')
+rownames(chaffin22_counts) <- chaffin22_counts[[1]]
+chaffin22_counts <- select(chaffin22_counts, -1)
+
+chaffin22_obs <- read_csv('OUTPUT/Transcriptomic/Chaffin22/chaffin22_pseudobulk_metadata.csv')
+chaffin22_var <- read_csv('OUTPUT/Transcriptomic/Chaffin22/chaffin22_pseudobulk_gene_info.csv')
+```
+
+This creates another df with bulked counts where the different cell types counts are summed up on a per-donor basis -> per-donor count.
+
+```{r}
+
+chaffin22_bulked_counts_list <- vector('list',length(unique(str_match(colnames(chaffin22_counts),'(^P\\d+)_')[,2])))
+donor_ids <- unique(str_match(colnames(chaffin22_counts),'(^P\\d+)_')[,2])
+
+for (i in seq_along(donor_ids)){
+  chaffin22_bulked_counts_list[[i]] <- chaffin22_counts %>%
+    select(contains(donor_ids[i])) %>%
+    rowwise() %>%
+    summarise(bulk_count = sum(c_across(everything()))) %>%
+    ungroup()
+  
+  colnames(chaffin22_bulked_counts_list[[i]]) <- donor_ids[[i]]
+}
+
+chaffin22_bulked_counts <- chaffin22_bulked_counts_list %>% bind_cols()
+rm(chaffin22_bulked_counts_list)
+
+#Also create an obs variable corresponding to the donor id
+chaffin22_bulk_obs <- chaffin22_obs %>%
+  select(donor_id, disease, age, sex) %>%
+  unique()
+
+```
+
+## DEA
+```{r}
+dea_function <- function(counts, samples, genes, condition_filter, model_type='t_test'){
+  dge<- DGEList(counts=counts, samples=samples, genes=genes)
+  idx = dge$samples$disease %in% condition_filter
+  dge <- dge[, idx]
+  
+  dge$samples$disease <- factor(dge$samples$disease)
+  dge$samples$disease <- relevel(dge$samples$disease, ref='NF')
+  
+  design <- model.matrix(~disease+age+sex, data = dge$samples)
+  # Calculate normalization factors
+  dge <- calcNormFactors(dge)
+  
+  # Run voom
+  v <- voom(dge, design, plot=TRUE)
+  
+  if(model_type=='limma_voom'){
+    # Fit the linear model using weighted least squares for gene
+    fit <- lmFit(v, design)
+    
+    # Apply empirical Bayes moderation
+    fit <- eBayes(fit)
+    
+    top_genes <- topTable(fit, coef=str_c("disease",condition_filter[2]), n=Inf)
+    print(top_genes)
+    
+    return(top_genes)
+    
+  } else if (model_type =='t_test'){
+    
+    results <- data.frame(
+      Gene = v$genes,
+      logFC = numeric(nrow(v)),
+      P.Value = numeric(nrow(v)),
+      row.names = rownames(v)
+    ) 
+
+  # Loop through each gene
+    for (i in 1:nrow(v)) {
+      # Fit a standard linear model, but give it the voom weights
+      fit_lm <- lm(
+        v$E[i,] ~ age + sex + disease,
+        data = v$targets,
+        weights = v$weights[i,]
+      )
+    
+      # Extract the summary and the p-value for our condition of interest
+      fit_summary <- summary(fit_lm)
+      coefficients <- fit_summary$coefficients
+      
+      # Check if the coefficient exists before trying to access it
+      if(str_c("disease",condition_filter[2]) %in% rownames(coefficients)){
+        results$logFC[i] <- coefficients[str_c("disease",condition_filter[2]), "Estimate"]
+        results$P.Value[i] <- coefficients[str_c("disease",condition_filter[2]), "Pr(>|t|)"]
+      }
+    }
+    
+    # --- 5. Apply Multiple Testing Correction ---
+    # It is essential to adjust the raw p-values for multiple comparisons.
+    results$FDR <- p.adjust(results$P.Value, method = "BH")
+    results <- results %>%
+      select(Gene = `Gene....1`, 'logFC','P.Value','FDR')
+    
+    return(results)
+    
+  } else{
+      print('Model type not well defined')
+    }
+
+}
+```
+
+
+```{r}
+dge_bulk_hcm <- dea_function(chaffin22_bulked_counts, chaffin22_bulk_obs, chaffin22_var, c('NF','HCM')) %>%
+  mutate(group='Bulk', comparison='HCM_vs_NF')
+
+#This pseudo-bulk analysis replicates the two MTC-sig. findings from Chaffin et al, 2022 i.e elevated TNNI3 and depressed ANGPT2
+
+dge_cm_hcm <- dea_function(select(chaffin22_counts, contains('Cardiomyocyte')), filter(chaffin22_obs, str_detect(sample_id, 'Cardiomyocyte')), chaffin22_var, c('NF','HCM')) %>%
+  mutate(group='CM', comparison='HCM_vs_NF')
+
+dge_fibr_hcm <- dea_function(select(chaffin22_counts, matches(regex('_Fibroblast'))), filter(chaffin22_obs, str_detect(sample_id, '_Fibroblast')), chaffin22_var, c('NF','HCM')) %>%
+  mutate(group='FB', comparison='HCM_vs_NF')
+
+```
+Run for DCM vs. NF
+
+```{r}
+dge_bulk_dcm <- dea_function(chaffin22_bulked_counts, chaffin22_bulk_obs, chaffin22_var, c('NF','DCM')) %>%
+  mutate(group='Bulk', comparison='DCM_vs_NF')
+
+#This pseudo-bulk analysis replicates the two MTC-sig. findings from Chaffin et al, 2022 i.e elevated TNNI3 and depressed ANGPT2
+
+dge_cm_dcm <- dea_function(select(chaffin22_counts, contains('Cardiomyocyte')), filter(chaffin22_obs, str_detect(sample_id, 'Cardiomyocyte')), chaffin22_var, c('NF','DCM')) %>%
+  mutate(group='CM', comparison='DCM_vs_NF')
+
+dge_fibr_dcm <- dea_function(select(chaffin22_counts, matches(regex('_Fibroblast'))), filter(chaffin22_obs, str_detect(sample_id, '_Fibroblast')), chaffin22_var, c('NF','DCM')) %>%
+  mutate(group='FB', comparison='DCM_vs_NF')
+```
+## Output Plots
+
+Plot the scatter of HCM vs. DCM by logFC for bulk and for CMs.
+Plot the volcano within bulk and within CMs.
+
+```{r}
+
+plotter <- function(input_hcm, input_dcm, output_name, output_path ='OUTPUT/Transcriptomic/Chaffin22/plots/', label=F) {
+  if(!dir.exists(output_path)){
+    dir.create(output_path)
+  }
+  
+  #This is for the HCM vs. DCM scatter plot of logFC
+  
+  plot_tb <- input_hcm %>%
+    select(Gene, logFC, P.Value) %>%
+    mutate(Disease = 'HCM') %>%
+    bind_rows(select(input_dcm, Gene, logFC, P.Value) %>% mutate(Disease = 'DCM')) %>%
+    mutate(FDR = p.adjust(P.Value, method='BH')) %>%
+    pivot_wider(names_from='Disease', values_from=c('logFC','P.Value','FDR')) %>%
+    mutate(pval_label = str_c('HCM: ', signif(FDR_HCM,2), '| DCM: ',signif(FDR_DCM,2)) )
+  
+  max_xcoord <- max(abs(plot_tb$logFC_DCM))
+  max_ycoord <- max(abs(plot_tb$logFC_HCM))
+    
+  
+  scatter <- ggplot(plot_tb, aes(x=logFC_DCM, y=logFC_HCM,col=Gene))+
+    geom_point()+
+    scale_colour_brewer(palette='Set1')+
+    xlab('LogFC (DCM vs. NF)')+
+    ylab('LogFC (HCM vs. NF)')+
+    # geom_abline(slope=1, intercept=0, linetype='dashed', col='black')+
+    geom_hline(yintercept=0, linetype='dashed')+
+    geom_vline(xintercept=0, linetype='dashed')+
+    scale_x_continuous(limits=c(-max_xcoord-1, max_xcoord+1))+
+    scale_y_continuous(limits=c(-max_ycoord-1, max_ycoord+1))
+  
+  suffix <- ''
+  if(isTRUE(label)){
+    scatter <- scatter+
+      geom_text_repel(aes(label=pval_label))+
+    suffix <- '_label'
+  }
+  
+  
+  print(scatter)
+  ggsave(str_c(output_path, output_name,'_scatter',suffix,'.png'), dpi=600)
+  
+  ##----------------------------------------------------------------
+  
+  #This is for the volcano plot with both HCM and DCM (vs NF)
+  plot_tb2 <- input_hcm %>%
+    select(Gene, logFC, P.Value) %>%
+    mutate(Disease = 'HCM') %>%
+    bind_rows(select(input_dcm, Gene, logFC, P.Value) %>% mutate(Disease = 'DCM')) %>%
+    mutate(FDR = p.adjust(P.Value, method='BH')) %>%
+    mutate(FDR_sig = ifelse(FDR < 0.05, T,F)) %>%
+    rowwise() %>%
+    mutate(label = ifelse(FDR_sig == T, str_c(Gene, Disease, sep='_'), '')) %>%
+    ungroup() %>%
+    mutate(colour = factor(ifelse(FDR_sig == T, Gene, 'Not FDR Sig.'))) %>%
+    mutate(colour = fct_relevel(colour, 'Not FDR Sig.', after=Inf))
+  
+    manual_level <- "Not FDR Sig."
+    # Get all other levels that should be coloured by the brewer palette
+    other_levels <- setdiff(levels(plot_tb2$colour), manual_level)
+    
+    # Generate colours for the 'other' levels using the Dark2 palette
+    # The 'n' for brewer.pal must be at least 3 for this palette
+    n <- max(length(other_levels), 3)
+    palette_for_others <- brewer.pal(n, "Dark2")
+    
+    # Create a named vector for the 'other' levels
+    # and subset it to the exact number of levels needed
+    other_colours <- palette_for_others[1:length(other_levels)]
+    names(other_colours) <- other_levels
+    
+    # 3. Combine your manual colour with the generated palette
+    # This creates the final, complete named vector
+    final_colours <- c(other_colours, "Not FDR. Sig." = "grey80")
+  
+  # colscale <- c(
+  #   '#1b9e77',
+  #   '#d95f02',
+  #   '#7570b3',
+  #   '#e7298a',
+  #   '#66a61e',
+  #   '#e6ab02',
+  #   '#666666'
+  # )
+  
+  volcano <- ggplot(plot_tb2, aes(x=logFC, y=-log10(FDR), col=colour, shape=Disease))+
+    geom_hline(yintercept=-log10(0.05), linetype='dashed', col='black')+
+    geom_vline(xintercept=0, linetype='dashed', col='black')+
+    geom_point()+
+    xlab('Log2FC')+
+    ylab('-log10(FDR-adjusted p-value)')+
+    scale_colour_manual(values=final_colours, name='Gene')+
+    labs(caption='Grey means not FDR-significant')+
+    geom_text_repel(aes(label=label))
+  
+  print(volcano)
+  ggsave(str_c(output_path, output_name,'_volcano',suffix,'.png'), dpi=600)
+  
+
+}
+
+plotter(dge_bulk_hcm, dge_bulk_dcm, 'hcm_dcm_bulk')
+plotter(dge_cm_hcm, dge_cm_dcm, 'hcm_dcm_cm')
+plotter(dge_fibr_hcm, dge_fibr_dcm, 'hcm_dcm_fibr')
+```
+

@@ -1,0 +1,861 @@
+---
+title: "HCMR Cross-Trait Association Analysis"
+author: "Jonathan Chan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(viridis)
+library(ggsignif)
+library(car)
+rm(list=ls())
+
+#Setting theme for ggplot to classic - You can change your plot text font and size here
+theme_set(
+  theme_classic()
+  + theme(text = element_text(family = 'sans', size=14))
+  ) 
+```
+
+This notebook looks at cross-trait associations within HCMR, evaluating them using multivariate linear regression of both joint and marginal models to correct for confounders such as age;sex; BMI and BSA (where necessary).
+
+# Import
+
+```{r import}
+#This is as per OMGL classifications
+hcmr_rarevar <- read_tsv('DATA/HCMR/hcmr_rarevar_class_plp_vusfpvus.tsv') %>%
+  dplyr::rename('rarevar_class'=class, 'HCR_IDs'='HCR_ID')
+
+total_df_notransform <- readRDS('DATA/HCMR/total_notransform_df.rds') %>%
+  mutate(ecvfwhole=ecvfwhole*100)
+
+total_i_all_cont_phenotypes <- readRDS('DATA/HCMR/total_i_all_cont_phenotypes.rds')
+
+total_df_notransform_rare <- left_join(total_df_notransform, select(hcmr_rarevar, HCR_IDs, rarevar_class))
+total_i_all_cont_phenotypes <- c(total_i_all_cont_phenotypes, ncol(total_df_notransform_rare)-1,ncol(total_df_notransform_rare))
+rm(total_df_notransform)
+
+label_tb <- read_tsv('DATA/HCMR/combo_labels.tsv') 
+label_tb$Label[label_tb$Variable=='ecvfwhole'] <- 'Whole LV ECVF (based on 3 slices) (%)'
+
+
+#Subset to variables of interest
+i_cont_biomarker <- seq(139,148)
+vars_of_interest <- c('HCR_IDs','age','gender','height','weight','bmi','bsa','blnyha','cmrsysbp','cmrdiabp', colnames(total_df_notransform_rare)[i_cont_biomarker], 'lge_total','lvmassi','ci','wallthkmax','lvef','ecvfwhole','lvs_eccmean','lvs_ellmean','lvs_errmean','rarevar_class','sarcomere','lge_pres')
+
+#Select all of the variables of interest
+filtered_tb <- total_df_notransform_rare %>% 
+  select(all_of(vars_of_interest)) 
+
+
+#Import in the 10PCs generated in HCMR only
+eigenvectors <- read_tsv('DATA/HCMR/eigenvectors_hcmr_10pcs') %>%
+  rename_with(~str_replace(.,'U','pc'),contains('U'))
+
+filtered_tb <- filtered_tb %>%
+  left_join(select(eigenvectors, IID, pc1:pc5), by=c('HCR_IDs' = 'IID')) %>%
+  filter(!is.na(pc1), !is.na(age), !is.na(gender), !is.na(bmi))
+
+print(str_c(nrow(filtered_tb), ' HCMR patients are analysed with non-NA values in age; gender; BMI and common genetic PCs'))
+```
+# Normalisation
+
+For ease of comparison, I will transform all the biomarkers using inverse-rank based transformation.
+
+For comparison sakes (i.e to compare across the phenotypes individually), I also do the same across all CMR endophenotypes.
+
+```{r normalisation}
+log_transformer <- function(data,columns){ #Columns are a vector of characters
+  
+  for (i in columns){
+    data[[i]] <- log1p(data[[i]])
+    data[[i]] <- scale(data[[i]])
+    hist(data[[i]], main=i,xlab=i)
+  }
+  
+  return(data)
+}
+
+inverse_rank_transformer <- function(data,columns){ #Columns are a vector of characters
+  
+  for (i in columns){
+    col_label <- i
+    col_label_before <- columns[match(i,columns)-1]
+    mask <- !is.na(data[[i]]) #Mask to filter out NA values
+                             
+    # Filter out NA values for that phenotype
+    data_copy <- subset(data, mask)
+    data_copy[[i]] <- RNOmni::RankNorm(data_copy[[i]]) #Performing rank-inverse normalisation
+    data_copy <- select(data_copy, 'HCR_IDs',all_of(i)) #Taking only the column with SitePatID and the column of interest
+    
+    data <- select(data, - i) %>% #Removing the original column and adding back the new column after rank-inverse normalisation
+      left_join(data_copy, by='HCR_IDs') %>%
+      relocate(i, .after=!!col_label_before) #Moving the appended column back to its original index
+    
+    hist(data[[i]], main=i,xlab=i)
+  }
+  return(data)
+}
+
+# log_transform_columns <- c(
+#   vars_of_interest[11:20]
+# )
+# log_transform_columns <- log_transform_columns[!log_transform_columns %in% c('TnTStat','mmp1_timp1','NTproBNP','gal3','st2', 'mmp1','timp1','cicp','bap','cicp_bap')]
+# log_transformed_tb <- log_transformer(filtered_tb, log_transform_columns)
+```
+
+
+```{r normalisation}
+#Define the groups of variables used
+pp <- c('NTproBNP','TnTStat','gal3','st2','mmp1','cicp')
+fibr <- c('lge_total','ecvfwhole')
+func <- c('lvef','lvs_ellmean','lvs_eccmean','lvs_errmean','ci')
+hty <- c('lvmassi')
+```
+
+
+```{r normalisation}
+#Inverse based rank transform pp
+rank_transform_columns <- c(pp,fibr,func, hty, 'wallthkmax')
+# rank_transform_columns <- c(pp)
+rank_transformed_tb <- inverse_rank_transformer(filtered_tb, rank_transform_columns)
+
+#Merge back everything together
+
+transformed_tb <- select(filtered_tb, colnames(filtered_tb)[!colnames(filtered_tb) %in% c(#log_transform_columns, 
+  rank_transform_columns)]) %>%
+  #bind_cols(select(log_transformed_tb, log_transform_columns)) %>%
+  bind_cols(select(rank_transformed_tb, rank_transform_columns)) 
+  # %>% mutate(cv_prs=scale(cv_prs)) #Also need to scale CV_PRS
+
+rm(log_transformed_tb, rank_transformed_tb)
+
+#Adjust the label tb to represent the transformations
+label_tb <- label_tb %>% 
+  mutate(Label = case_when(Variable %in% c(#log_transform_columns, 
+    rank_transform_columns) ~ str_c(str_match(Label,'(^[^\\(]+)')[,2],
+                                                                                                  ' (SD)'),
+                           T~Label))
+  
+
+```
+### Summary Table
+
+This outputs a summary table for publication.
+
+```{r}
+#Only rank-transform the pp and not the CMR parameters
+
+#Inverse based rank transform pp
+rank_transform_columns <- c(pp)
+rank_transformed_tb <- inverse_rank_transformer(filtered_tb, rank_transform_columns)
+
+#Merge back everything together
+
+pponly_transformed_tb <- select(filtered_tb, colnames(filtered_tb)[!colnames(filtered_tb) %in% c(#log_transform_columns, 
+  rank_transform_columns)]) %>%
+  #bind_cols(select(log_transformed_tb, log_transform_columns)) %>%
+  bind_cols(select(rank_transformed_tb, rank_transform_columns)) 
+  # %>%mutate(cv_prs=scale(cv_prs)) #Also need to scale CV_PRS
+
+rm(log_transformed_tb, rank_transformed_tb)
+```
+
+```{r}
+covars <- c('age','sex','self_reported_ethnicity','bmi','bsa','cmrdiabp','sarcomere')
+
+#Run pairwise Spearman rank correlation matrix between each of the continuous covariates (not sex, ethnicity or sarcomere) in the pponly_transformed_tb
+quant_covars <- covars[!covars %in% c('sex','self_reported_ethnicity','sarcomere')]
+cor_matrix <- pponly_transformed_tb %>%
+  select(all_of(quant_covars)) %>%
+  cor(method='spearman', use='pairwise.complete.obs')
+print(cor_matrix)
+
+highly_correlated_pairs <- which(abs(cor_matrix) > 0.8 & abs(cor_matrix) < 1.00, arr.ind = TRUE)
+for (i in seq_len(nrow(highly_correlated_pairs))) {
+  row <- highly_correlated_pairs[i, 1]
+  col <- highly_correlated_pairs[i, 2]
+  cat(sprintf("Highly correlated pair: %s and %s with correlation %.2f\n",
+              colnames(cor_matrix)[row],
+              colnames(cor_matrix)[col],
+              cor_matrix[row, col]))
+}
+
+#Add back the self-reported ethnicity to 
+summary_tb <- pponly_transformed_tb %>%
+  left_join(select(total_df_notransform_rare,HCR_IDs,race)) %>%
+  select(-starts_with('pc')) %>%
+  dplyr::rename('sex'='gender','self_reported_ethnicity'='race') %>%
+  select(all_of(c(covars,'wallthkmax',hty, func,fibr,pp)))
+
+#Evaluate normality of each continuous variable
+walk2(select(summary_tb, all_of(pp)), pp,~print(hist(.x, xlab = .y)))
+walk2(select(summary_tb, all_of(covars[!covars %in% c('sex','self_reported_ethnicity','sarcomere')])), covars[!covars %in% c('sex','self_reported_ethnicity','sarcomere')],~print(hist(.x, xlab = .y)))
+walk2(select(summary_tb, all_of(c('wallthkmax',hty,func,fibr))), c('wallthkmax',hty,func,fibr),~print(hist(.x, xlab = .y)))
+```
+
+```{r}
+
+```
+```{r}
+generate_summary_table_R <- function(input_df,
+                                     output_tsv_path,
+                                     mean_sd_vars = character(0),
+                                     median_iqr_vars = character(0)) {
+  # Check if input is a data frame
+  if (!is.data.frame(input_df)) {
+    stop("Input must be a data frame or tibble.")
+  }
+
+  # Get column names from the input data frame
+  col_names <- names(input_df)
+
+  # Handle the case of an empty data frame (0 columns)
+  if (length(col_names) == 0) {
+    summary_tibble <- tibble(
+      Original_Column = character(),
+      Summary = character(),
+      Non_NA_Count = integer()
+    )
+  } else {
+    # Use purrr::map_dfr to iterate over column names and create a summary row for each
+    summary_tibble <- purrr::map_dfr(col_names, function(col_name) {
+      column_vector <- dplyr::pull(input_df, col_name)
+      non_na_count <- sum(!is.na(column_vector))
+      summary_str <- "Error: Type not handled" # Default if no specific logic matches
+
+      # 1. Qualitative columns (character, factor, logical)
+      if (is.character(column_vector) || is.factor(column_vector) || is.logical(column_vector)) {
+        if (non_na_count > 0) {
+          temp_df <- dplyr::tibble(value_col = column_vector)
+          
+          category_summary_data <- temp_df %>%
+            dplyr::filter(!is.na(value_col)) %>%
+            dplyr::count(value_col, name = "n_cat") %>%
+            dplyr::mutate(perc_cat = (n_cat / sum(n_cat)) * 100) %>%
+            # Order categories by name for consistency
+            dplyr::arrange(as.character(value_col)) 
+
+          category_strings <- category_summary_data %>%
+            dplyr::mutate(text = sprintf("%s: %d (%.1f%%)", as.character(value_col), n_cat, perc_cat)) %>%
+            dplyr::pull(text)
+          
+          summary_str <- paste(category_strings, collapse = "; ")
+        } else {
+          summary_str <- "N/A (empty qualitative)"
+        }
+      } 
+      # 2. Numeric columns
+      else if (is.numeric(column_vector)) {
+        if (non_na_count > 0) {
+          if (col_name %in% mean_sd_vars) {
+            mean_val <- mean(column_vector, na.rm = TRUE)
+            sd_val <- sd(column_vector, na.rm = TRUE)
+            if (is.na(sd_val)) { # sd can be NA if only one non-NA value or all identical
+              summary_str <- sprintf("%.2f (SD N/A)", mean_val)
+            } else {
+              summary_str <- sprintf("%.2f \U00B1 %.2f", mean_val, sd_val) # Using Unicode for ±
+            }
+          } else if (col_name %in% median_iqr_vars) {
+            median_val <- median(column_vector, na.rm = TRUE)
+            q1_val <- quantile(column_vector, 0.25, na.rm = TRUE, names = FALSE)
+            q3_val <- quantile(column_vector, 0.75, na.rm = TRUE, names = FALSE)
+            summary_str <- sprintf("%.2f [%.2f - %.2f]", median_val, q1_val, q3_val)
+          } else { # Default for numeric columns not specified in either list i.e median
+            median_val <- median(column_vector, na.rm = TRUE)
+            q1_val <- quantile(column_vector, 0.25, na.rm = TRUE, names = FALSE)
+            q3_val <- quantile(column_vector, 0.75, na.rm = TRUE, names = FALSE)
+            summary_str <- sprintf("%.2f [%.2f - %.2f]", median_val, q1_val, q3_val)
+          }
+        } else {
+          summary_str <- "N/A (empty numeric)"
+        }
+      }
+      # 3. Other types (should ideally not happen with typical data frames)
+      else {
+        summary_str <- "N/A (unsupported type)"
+      }
+      
+      dplyr::tibble(
+        Original_Column = col_name,
+        Summary = summary_str,
+        Non_NA_Count = as.integer(non_na_count)
+      )
+    })
+  }
+
+  # Write the summary tibble to a TSV file
+  readr::write_tsv(summary_tibble, output_tsv_path)
+  
+  message(paste("Summary table successfully saved to", output_tsv_path))
+  # Optionally return the tibble for use in R environment
+  return(summary_tibble)
+}
+```
+
+```{r}
+hcmr_summary_output <- generate_summary_table_R(summary_tb, 'OUTPUT/HCMR/hcmr_summary_nontransformedCMR.tsv', 
+                         mean_sd_vars=c(pp, 'bsa, cmrdiabp'),
+                         median_iqr_vars = c('age','bmi',c('wallthkmax',hty,func,fibr)))
+```
+
+# Multivariate Regression Analysis
+
+This performs multivariate linear regression (for continuous phenotypes) against the phenotype of interest + covariates of age/sex/BMI/BSA (if non-indexed).
+You have to be careful about linear regression assumptions as well so some traits e.g LGE and the biomarkers need to be normalised.
+
+The assumptions of multivariate linear regression include:
+
+- Lack of multicollinearity (addressed by assessing VIF)
+- Multivariate normality i.e residuals normally distributed (addressed by evaluating QQplots of residuals)
+- Homoscedasticity of residuals (addressed by evaluating scale-location plot: flat horizontal line with equally spread points expected)
+- Linearity (addressed by evaluating scatterplot of residuals vs. predicted values: flat horizontal line expected)
+
+```{r multivariate_assessor_function}
+
+multivariate_assessor <- function(input_tb, response_var, predictor_vars, covars=c('age','gender','bmi','cmrdiabp','pc1','pc2','pc3','pc4','pc5', 'sarcomere'),cont_or_discrete_response='cont', model_return=F, summary_print=T, ivnormalise=F){ #Assume already rank-based inverse normalised
+  
+  formula <- str_c(response_var, '~',
+                   str_c(covars, collapse='+'),'+',
+                   str_c(predictor_vars,collapse='+'))
+  
+  input_tb <- filter(input_tb, !is.na(!!sym(response_var))) #Exclude rows with NA values in the response variable
+  
+  if(cont_or_discrete_response=='cont'){
+    model <- lm(formula, data=input_tb)
+    
+      if(isTRUE(ivnormalise)){
+    input_tb[[response_var]] <- RNOmni::RankNorm(input_tb[[response_var]])
+  }
+    
+  } else if (cont_or_discrete_response=='discrete'){
+    model <- glm(formula,data=input_tb, family='binomial' )
+  }
+  
+   if(isTRUE(summary_print)){
+      print(str_c('Phenotype',response_var, 'tested for association with', str_c(predictor_vars, collapse=', '),sep=' '))
+      print(summary(model))
+   }
+  
+  #Evaluate the assumptions of multiple linear regression
+  
+  #Check for multicollinearity (using variance inflation factor)
+  if(sum(vif(model)>5)>=1){ #If any of the coefficients have VIF greater than 5
+    print('Variance inflation factor >5 detected in the model suggests multicollinearity')
+    stop()
+  }
+  
+  #Plot diagnostic plots including
+  ## Residuals vs. predicted (to evaluate linearity assumption)
+  ## Scale-location plot to evaluate homoscedasticity
+  ## Residuals QQplot to evaluate normality of residuals
+  ## Outliers/high-leverage points via studentised residuals vs. leverage plot 
+  par(mfrow = c(2, 2))
+  plot(model)
+  
+  pvals <- summary(model)$coefficients
+  adjusted_rsq <- summary(model)$adj.r.squared
+  
+  output_tb <- as_tibble(pvals) %>%
+    bind_cols('Predictor'=rownames(pvals)) %>%
+    mutate('Pheno'=response_var) %>%
+    select(Pheno,Predictor, everything()) %>%
+    filter(Predictor %in% predictor_vars) 
+  colnames(output_tb) <- c('Pheno','Predictor','Estimate','SE','tvalue','pval')
+  
+  output_tb <- output_tb %>% 
+    mutate(upperSE = Estimate + SE,
+           lowerSE = Estimate - SE) %>%
+    select(-tvalue)
+  
+  if (isTRUE(model_return)){
+    return(model)
+  } else{
+    return(output_tb)
+  }
+}
+```
+
+```{r summary_plotter}
+
+summary_plotter <- function(input_tb,output_label, output_path='OUTPUT/HCMR/crosspheno_assoc/summary_plots/', pval='bonferroni',confint=F, se=F,test='t-Test', xlabel='Change in Phenotype per Unit Increase in Predictor'){
+  
+  if(length(unique(input_tb$Pheno))>8){
+    Palette <- 'Paired'
+  } else {
+    Palette <- 'Dark2'
+  }
+  
+  if (pval=='fdr'){
+    input_tb <- input_tb %>%
+    mutate(pval = p.adjust(pval, 'fdr'))
+  } 
+ 
+  summary_cont_plot <- ggplot(input_tb, aes(x=Estimate, y=-log10(pval), col=Label, shape=Label2))+
+    geom_vline(xintercept=0, linetype='dashed')+
+    geom_point()+
+    scale_colour_brewer(palette=Palette)+
+    labs(col='Phenotype',shape='Predictor')+
+    scale_x_continuous(n.breaks=10)+
+    xlab(xlabel)+
+    ylab('-log10(p-value)')+
+    labs(title=str_wrap(str_c('Summary plot of ', test,' tests for ',length(unique(input_tb$Pheno)), ' phenotypes across ', length(unique(input_tb$Predictor)), ' predictors')))
+  
+  if (pval=='bonferroni'){
+    
+    summary_cont_plot <- summary_cont_plot +
+      geom_hline(yintercept=-log10(0.05/nrow(input_tb)), linetype='dashed')+
+      labs(caption=str_c('Bonferroni-corrected p-value threshold = ',signif(0.05/nrow(input_tb),3)))
+  } else if (pval =='fdr'){
+    summary_cont_plot <- summary_cont_plot +
+      geom_hline(yintercept=-log10(0.05), linetype='dashed')+
+      ylab('-log10(Adjusted p-value)')+
+      labs(caption='FDR correction applied for multiple testing burden')
+  }
+  
+  if(isTRUE(confint)){
+    summary_cont_plot <- summary_cont_plot +
+      geom_errorbar(aes(xmin=lowerCI, xmax=upperCI),alpha=0.5)
+    
+    append <- '_confint'
+  } else if(isTRUE(se)){
+      summary_cont_plot <- summary_cont_plot +
+      geom_errorbar(aes(xmin=lowerSE, xmax=upperSE),alpha=0.5)
+    
+    append <- '_SE'
+    }
+    else{
+    append <- ''
+  }
+  
+  print(summary_cont_plot)
+  ggsave(str_c(output_path,test,'_',output_label,'_summary_plot_',pval,append,'.png'),summary_cont_plot,dpi=600, width=12, height=6)
+  
+  return(input_tb)
+}
+
+
+```
+
+
+## Group 1: Cardiac Fibrosis; Plasma Proteins; CMR Function/Hypertrophy Triangle
+
+Note that when using groups of predictors, you should remove correlated predictors due to multicollinearity.
+
+So there is some relationship likely between these three factors so assess:
+
+1. Fibrosis ~ plasma proteins
+2. Functional measures ~ plasma proteins
+3. Hypertrophy measures ~ plasma proteins
+
+### Joint CMR vs. Plasma Proteins Association Analysis
+
+This evaluates in a joint model (i.e all together).
+
+```{r g1_comp_vs_pp}
+# #Fibrosis ~ plasma proteins
+# print('Evaluating fibrosis ~ plasma')
+# fibr_vs_pp <- map(fibr,~multivariate_assessor(transformed_tb,.x,pp))%>% bind_rows()
+# 
+# #Evaluate separately for LGE_pres due to discrete nature
+# lge_pres_vs_pp <- multivariate_assessor(transformed_tb, 'lge_pres',pp,cont_or_discrete_response = 'discrete')
+# fibr_vs_pp <- bind_rows(fibr_vs_pp, lge_pres_vs_pp)
+# rm(lge_pres_vs_pp)
+# 
+# #Functional ~ plasma proteins
+# print('Evaluating functional ~ plasma')
+# func_vs_pp <- map(func,~multivariate_assessor(transformed_tb,.x,pp))%>% bind_rows()
+# 
+# #Hypertrophy ~ plasma proteins
+# print('Evaluating hypertrophy ~ plasma')
+# hty_vs_pp <- map(hty,~multivariate_assessor(transformed_tb,.x,pp))%>% bind_rows()
+# 
+# #Evaluate separately for wallthkmax due to need for BSA covariate
+# wallthkmax_vs_pp <- multivariate_assessor(transformed_tb, 'wallthkmax',pp,covars=c('age','gender','bmi','bsa','pc1','pc2','pc3','pc4','pc5'))
+# hty_vs_pp <- bind_rows(hty_vs_pp, wallthkmax_vs_pp)
+# rm(wallthkmax_vs_pp)
+# 
+# all_vs_pp <- bind_rows(fibr_vs_pp, func_vs_pp, hty_vs_pp) %>%
+#   left_join(select(label_tb,Variable,Label), by=c('Pheno'='Variable')) %>%
+#   left_join(select(label_tb,Variable,Label2=Label), by=c('Predictor'='Variable'))
+# rm(fibr_vs_pp, func_vs_pp, hty_vs_pp)
+```
+
+##### Summary Plot of Joint CMR Measures vs. Plasma Proteins
+
+```{r g1_all_vs_pp_plot, fig.width=12, fig.height=6}
+
+# summary_plotter(all_vs_pp,output_label='all_vs_pp_sarc',pval='fdr',se=F)
+# summary_plotter(all_vs_pp,output_label='all_vs_pp_sarc',pval='fdr',se=T)
+
+```
+
+### Marginal CMR vs. Plasma Proteins Association Analysis
+
+I also analyse each plasma protein individually via marginal models (hence CMR measure ~ covariates + plasma protein z).
+
+```{r marginal_cmr_vs_pp}
+#Fibrosis ~ plasma proteins
+print('Evaluating fibrosis ~ plasma marginally')
+fibr_vs_pp_combinations <- as.list(expand_grid(fibr,pp))
+fibr_vs_pp_marginal <- map2(fibr_vs_pp_combinations[[1]],fibr_vs_pp_combinations[[2]],~multivariate_assessor(transformed_tb,.x,.y))%>% bind_rows()
+rm(fibr_vs_pp_combinations)
+
+#Evaluate separately for LGE_pres due to discrete nature
+# lge_pres_vs_pp_combinations <- as.list(expand_grid('lge_pres',pp))
+# lge_pres_vs_pp_marginal <- map2(lge_pres_vs_pp_combinations[[1]],lge_pres_vs_pp_combinations[[2]],~multivariate_assessor(transformed_tb,.x,.y,cont_or_discrete_response = 'discrete'))%>% bind_rows()
+# fibr_vs_pp_marginal <- bind_rows(fibr_vs_pp_marginal, lge_pres_vs_pp_marginal)
+# rm(lge_pres_vs_pp_marginal)
+
+#Functional ~ plasma proteins
+print('Evaluating functional ~ plasma marginally')
+func_vs_pp_combinations <- as.list(expand_grid(func,pp))
+func_vs_pp_marginal <- map2(func_vs_pp_combinations[[1]],func_vs_pp_combinations[[2]],~multivariate_assessor(transformed_tb,.x,.y))%>% bind_rows()
+
+#Hypertrophy ~ plasma proteins
+print('Evaluating hypertrophy ~ plasma marginally')
+hty_vs_pp_combinations <- as.list(expand_grid(hty,pp))
+hty_vs_pp_marginal <- map2(hty_vs_pp_combinations[[1]],hty_vs_pp_combinations[[2]],~multivariate_assessor(transformed_tb,.x,.y))%>% bind_rows()
+
+#Evaluate separately for wallthkmax due to need for BSA covariate
+wallthkmax_vs_pp_combinations <- as.list(expand_grid('wallthkmax',pp))
+wallthkmax_vs_pp_marginal <- map2(wallthkmax_vs_pp_combinations[[1]],wallthkmax_vs_pp_combinations[[2]],~multivariate_assessor(transformed_tb,.x,.y,covars=c('age','gender','bmi','cmrdiabp','pc1','pc2','pc3','pc4','pc5', 'sarcomere', 'bsa')))%>% bind_rows()
+hty_vs_pp_marginal <- bind_rows(hty_vs_pp_marginal, wallthkmax_vs_pp_marginal)
+rm(wallthkmax_vs_pp_marginal)
+
+all_vs_pp_marginal <- bind_rows(fibr_vs_pp_marginal, func_vs_pp_marginal, hty_vs_pp_marginal) %>%
+  left_join(select(label_tb,Variable,Label), by=c('Pheno'='Variable')) %>%
+  left_join(select(label_tb,Variable,Label2=Label), by=c('Predictor'='Variable'))
+rm(fibr_vs_pp_marginal, func_vs_pp_marginal, hty_vs_pp_marginal)
+
+```
+
+Add colour and shape variables for plotting to the tb.
+
+```{r}
+#Remove lge_presence
+all_vs_pp_marginal <- all_vs_pp_marginal %>%
+  filter(Pheno != 'lge_pres')
+
+all_vs_pp_marginal <- all_vs_pp_marginal %>%
+  mutate(phenogroup = case_when(Pheno %in% func ~ 'Contractile Function',
+                              Pheno %in% fibr ~ 'Fibrosis',
+                              Pheno %in% hty | Pheno == 'wallthkmax' ~'Hypertrophy',
+                              T~'other'))
+shape_mapping <- c('lvmassi'=17,'wallthkmax'=18,  # Hypertrophy shapes
+                    'lge_total' = 15, 'ecvfwhole' = 16,   # Fibrosis shapes
+                    'lvef' = 0, 'lvs_ellmean' =1, 'lvs_eccmean'=2, 'lvs_errmean' = 3, 'ci' = 4)   # Contractility shapes
+
+all_vs_pp_marginal <- all_vs_pp_marginal %>%
+  mutate(p_shape = shape_mapping[Pheno])
+
+write_tsv(all_vs_pp_marginal,'OUTPUT/HCMR/crosspheno_assoc/all_vs_pp_marginal.tsv')
+
+```
+
+##### Summary Plot of Marginal CMR Measures vs. Plasma Proteins
+
+```{r summary_marginal_cmr_vs_pp}
+summary_plotter(all_vs_pp_marginal,output_label='all_vs_pp_marginal_sarc',pval='fdr',se=F,xlabel='Change in Phenotype per SD of Plasma Protein')
+summary_plotter(all_vs_pp_marginal,output_label='all_vs_pp_marginal_sarc',pval='fdr',se=T,xlabel='Change in Phenotype per SD of Plasma Protein')
+```
+
+You can also plot out each individual plot on a per-biomarker basis, keeping the multiple testing correction the same by using the adjusted p-values over their entirety.
+
+```{r}
+summary_plotter_individualpredictor <- function(input_tb,predictor_of_interest, output_path='OUTPUT/HCMR/crosspheno_assoc/summary_plots/', pval='bonferroni',confint=F, se=F,test='t-Test', xlabel='Change in Phenotype per Unit Increase in Predictor', ylimits='', xlimits=''){
+
+  # if(length(unique(input_tb$Pheno))>8){
+  #   Palette <- 'Paired'
+  # } else {
+  #   Palette <- 'Dark2'
+  # }
+
+  if (pval=='fdr'){
+    input_tb <- input_tb %>%
+    mutate(pval = p.adjust(pval, 'fdr'))
+    p_threshold <- 0.05
+  } else if (pval=='bonferroni'){
+    p_threshold <- 0.05/nrow(input_tb) #Define the multiple testing corrected p-value threshold for ALL the phenotypes
+  }
+
+  input_tb <- input_tb %>%
+    filter(Predictor == predictor_of_interest)
+  
+  input_tb$p_shape <- setNames(input_tb$p_shape, input_tb$Label)
+
+  summary_cont_plot <- ggplot(input_tb, aes(x=Estimate, y=-log10(pval))) +
+    geom_vline(xintercept=0, linetype='dashed') +
+    geom_point(aes(col=phenogroup, shape=Label), size=4) +
+    scale_colour_brewer(palette='Set2')+
+    scale_shape_manual(values = input_tb$p_shape) +  # Fix: Assign shape values to Labels
+    labs(col='Phenotype Group', shape='Phenotype') +
+    scale_x_continuous(n.breaks=10) +
+    xlab(xlabel) +
+    ylab('-log10(p-value)') +
+    labs(title=str_wrap(str_c('Summary plot of ', test, ' tests for ',
+                              length(unique(input_tb$Pheno)), ' phenotypes across ',
+                              length(unique(input_tb$Predictor)), ' predictors')))
+  # +
+  #   theme(legend.position = "bottom",
+  #         legend.box = "vertical",
+  #         legend.box.just = "left" )+ 
+  #   guides(col=guide_legend(ncol=1, order=1), 
+  #          shape = guide_legend(ncol = 2, order=2))
+
+  if (pval=='bonferroni'){
+
+    summary_cont_plot <- summary_cont_plot +
+      geom_hline(yintercept=-log10(p_threshold), linetype='dashed')+
+      labs(caption=str_c('Bonferroni-corrected p-value threshold = ',signif(p_threshold,3)))
+  } else if (pval =='fdr'){
+    summary_cont_plot <- summary_cont_plot +
+      geom_hline(yintercept=-log10(p_threshold), linetype='dashed')+
+      ylab('-log10(Adjusted p-value)')+
+      labs(caption='FDR correction applied for multiple testing burden')
+  }
+
+  if(isTRUE(confint)){
+    summary_cont_plot <- summary_cont_plot +
+      geom_errorbar(aes(xmin=lowerCI, xmax=upperCI),alpha=0.5)
+
+    append <- '_confint'
+  } else if(isTRUE(se)){
+      summary_cont_plot <- summary_cont_plot +
+      geom_errorbar(aes(xmin=lowerSE, xmax=upperSE),alpha=0.5)
+
+    append <- '_SE'
+    }
+    else{
+    append <- ''
+    }
+  
+  if(!identical(ylimits,'')){
+    summary_cont_plot <- summary_cont_plot + 
+        scale_y_continuous(limits=ylimits)
+  }
+  
+  if(!identical(xlimits,'')){
+    summary_cont_plot <- summary_cont_plot + 
+        scale_x_continuous(n.breaks=10, limits=xlimits)
+  }
+  
+  append <- str_c(append, str_c(xlimits, collapse=''), '_', str_c(ylimits, collapse=''))
+
+  print(summary_cont_plot)
+  ggsave(str_c(output_path,test,'_',predictor_of_interest,'_indivpredictor_plot_',pval,append,'.png'),summary_cont_plot,dpi=600, width=12, height=6)
+}
+```
+
+Now run over all the pp.
+
+```{r}
+walk(pp, ~summary_plotter_individualpredictor(all_vs_pp_marginal, ., pval='fdr',se=T,xlabel='Change in Phenotype per SD of Plasma Protein'))
+
+walk(pp, ~summary_plotter_individualpredictor(all_vs_pp_marginal, ., pval='fdr',se=T,xlabel='Change in Phenotype per SD of Plasma Protein',ylimits=c(0,150), xlimits =c(-0.5,0.6)))
+
+walk(pp[!pp %in% c('NTproBNP','TnTStat')], ~summary_plotter_individualpredictor(all_vs_pp_marginal, ., pval='fdr',se=T,xlabel='Change in Phenotype per SD of Plasma Protein',ylimits=c(0,4), xlimits =c(-0.12,0.1)))
+```
+
+# Addendum - GWAS Prep
+
+This prepares the .pheno and .covar files for GWAS of HCMR plasma proteins using REGENIE.
+
+```{r}
+#Import in the total_df_notransform.rds containing phenotype information
+total_df_notransform <- readRDS('../../EDA_HCMR/output/data/total_notransform_df.rds')
+
+#Import in the 10PCs generated in HCMR only
+eigenvectors <- read_tsv('popgen/2_gwas/data/hcmr/HCMR_HARDCALLS/eigenvectors_hcmr_10pcs') %>%
+  rename_with(~str_replace(.,'U','pc'),contains('U'))
+
+#Join to total_df_notransform and plot a quick visualisation of PC1 vs. 2 mapped onto self-reported ancestry
+
+total_df_notransform <- total_df_notransform %>%
+  left_join(select(eigenvectors,-FID), by=c('HCR_IDs'='IID'))
+
+total_df_notransform <- filter(total_df_notransform,!is.na(pc1)) #Filters out HCR00011 who fails the hard-called genotypes QC filter
+
+pcplot <- ggplot(total_df_notransform, aes(x=pc1,y=pc2))+
+  geom_point(aes(col=race))
+print(pcplot) #Looks like good separation of self-reported ancestry
+
+```
+
+```{r}
+regenie_pheno_covar_prep <- function(input_tb, phenotypes_of_interest, output_filepath, samplefile_path, covariates=c('sex','age','height','weight',str_c('pc',seq(1,10))) ){
+
+  input_tb <- input_tb %>%
+        dplyr::rename(ID=HCR_IDs, sex=gender)
+  
+  snptest_sample <- input_tb %>%
+    select(sample_ID=ID, all_of(covariates), all_of(phenotypes_of_interest)) %>%
+     mutate(sex=case_when(sex=='Male'~1,
+                          sex=='Female'~0,
+                          T~NA)) %>%
+    mutate(across(.cols=everything(), as.character))
+  
+  sample_file <- read.table(samplefile_path, header=T) %>% #This is the original filepath for the .sample file corresponding to the .bgen file 
+    select(sample_ID=1) %>%
+    filter(sample_ID != 0) %>% #Filter out the first row which is a metadata row
+    mutate(sample_ID = as.character(sample_ID))
+  
+  snptest_sample <- left_join(sample_file, snptest_sample, by='sample_ID') %>% #This is needed to keep the correct order of rows in the sample ID as the .bgen file for UKB imputed genotypes
+    mutate(include=as.character(ifelse(sample_ID %in% input_tb$ID, T,F)))
+  
+  #snptest_sample <- filter(snptest_sample, include==T)
+  
+  regenie_covar <- snptest_sample %>%
+    select(FID = sample_ID, IID=sample_ID, all_of(covariates))
+  
+  regenie_pheno<- snptest_sample %>%
+    select(FID=sample_ID, IID=sample_ID, all_of(phenotypes_of_interest))
+  
+  #Also write sample inclusion file
+  regenie_sample_inclusion <- snptest_sample %>%
+    filter(include==T) %>%
+    select(FID=sample_ID, IID=sample_ID)
+  
+    #Also write non-NA phenotype and non-NA covariate .incl file for FINEMAP/LDSTORE2
+  nonNAphenocovar <- snptest_sample %>%
+    filter(if_any(phenotypes_of_interest, ~!is.na(.))) %>%
+    filter(if_all(covariates, ~!is.na(.))) %>%
+    select(sample_ID)
+  
+  write_tsv(regenie_covar, str_c(output_filepath,'regenie_hcmr_covar.tsv'))
+  write_tsv(regenie_pheno, str_c(output_filepath,'regenie_hcmr_pheno.tsv'))
+  write_tsv(regenie_sample_inclusion, str_c(output_filepath, 'regenie_hcmr_sampleinclusion.tsv'), col_names = F)
+  write_tsv(nonNAphenocovar, str_c(output_filepath, 'regenie_hcmr_sampleinclusion_nonNAphenocovars.incl'), col_names = F)
+  
+  return(list(regenie_pheno, regenie_covar))
+
+}
+
+hcmr_pp_regenie<- regenie_pheno_covar_prep(total_df_notransform,
+                                                       c('NTproBNP','TnTStat','mmp1','timp1','cicp','gal3','st2'),
+                                                       'popgen/2_gwas/data/hcmr/REGENIE/',
+                                                       'popgen/2_gwas/data/hcmr/hcmr_htscores_v2_essentialcols.sample')
+```
+
+## Misc.
+
+### NTproBNP Distribution comparison between HCMR and UKB
+
+```{r}
+#Assume you have run the import code in 2_UKB_CrossPheno_AssocAnalysis.Rmd
+
+merged_ntprobnp <- bind_rows(select(total_df_notransform, NTproBNP) %>% mutate(group='HCMR') %>% filter(!is.na(NTproBNP)) %>% mutate(NTproBNP = RNOmni::RankNorm(NTproBNP)), select(ukb_20240209_select_pp, NTproBNP) %>% mutate(group='UKB'))
+
+dist <- ggplot(merged_ntprobnp,aes(x=NTproBNP))+
+  geom_density(aes(fill=group, col=group),alpha=0.5)+
+  scale_colour_brewer(palette='Set2')+
+  scale_fill_brewer(palette='Set2')
+
+print(dist)
+```
+
+### Endophenotype Comparison within Sarc+ve via DBP
+
+This evaluates sarcomere +ve individuals to assess correlations between DBP and endophenotypes after adjusting for covariates.
+
+```{r}
+df <- transformed_tb %>%
+  filter(sarcomere==T)
+
+func_vs_dbp_marginal <- map(func,~multivariate_assessor(filtered_tb,.x,'cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5')))%>% bind_rows()
+hty_vs_dbp_marginal <- map(hty,~multivariate_assessor(filtered_tb,.x,'cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5')))%>% bind_rows()
+fibr_vs_dbp_marginal <- map(fibr,~multivariate_assessor(filtered_tb,.x,'cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5')))%>% bind_rows()
+maxlvwt_vs_dbp_marginal <- multivariate_assessor(df, 'wallthkmax','cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5','bsa'))
+
+all_vs_dbp_marginal <- bind_rows(fibr_vs_dbp_marginal, func_vs_dbp_marginal, hty_vs_dbp_marginal, maxlvwt_vs_dbp_marginal) %>%
+  left_join(select(label_tb,Variable,Label), by=c('Pheno'='Variable')) %>%
+  left_join(select(label_tb,Variable,Label2=Label), by=c('Predictor'='Variable'))
+rm(fibr_vs_dbp_marginal, func_vs_dbp_marginal, hty_vs_dbp_marginal, maxlvwt_vs_dbp_marginal)
+
+summary_plotter(all_vs_dbp_marginal,output_label='all_vs_dbp_marginal_sarcposonly',pval='fdr',se=F,xlabel='Change in Phenotype per 1mmHg of DBP')
+summary_plotter(all_vs_dbp_marginal,output_label='all_vs_dbp_marginal_sarcposonly',pval='fdr',se=T,xlabel='Change in Phenotype per 1mmHg of DBP')
+```
+
+### NTproBNP and Troponin Check in Normal LVEF vs. Decreased LVEF Patients
+
+```{r}
+
+#Convert LVEF and NTproBNP and TnTStat back to non-normalised form
+lvef_stratifier_tb <- left_join(select(transformed_tb,-lvef), select(total_df_notransform_rare, HCR_IDs, lvef), by='HCR_IDs')
+
+lvef_stratifier_check <- function(input_tb, pheno_of_interest,lvef_cutoff=50, plot_output_path = '../../EDA_HCMR/output/2_CrossPheno_AssocAnalysis/hcmr/misc/', suffix=''){
+  
+  input_tb <- input_tb %>%
+    filter(!is.na(lvef)) %>%
+    filter(!is.na(eval(parse(text=pheno_of_interest)))) %>%
+    mutate(group = ifelse(lvef < lvef_cutoff, str_c('< ',lvef_cutoff, '% LVEF'),str_c('>= ',lvef_cutoff, '% LVEF') ))
+  
+  wilcox_test <- wilcox.test(filter(input_tb, group==str_c('< ',lvef_cutoff, '% LVEF'))[[pheno_of_interest]],
+                   filter(input_tb, group==str_c('>= ',lvef_cutoff, '% LVEF'))[[pheno_of_interest]],
+                   alternative='two.sided', conf.int=T) #Welch t-test with unequal variance
+  
+  density_comp <- ggplot(input_tb, aes(x=eval(parse(text=pheno_of_interest)), fill=group))+
+    geom_density(alpha=0.5)+
+    ylab('Density')+
+    xlab(pheno_of_interest)+
+    labs(title=str_wrap(str_c('Density comparison with stratification by LVEF at ',lvef_cutoff, '% for phenotype ',pheno_of_interest)), subtitle = str_c('Non-NA individuals = ',nrow(input_tb)),
+         fill='Group',
+         caption= str_c('Wilcoxon p-value = ',signif(wilcox_test$p.value,3), ' with 95%CI = ', signif(wilcox_test$conf.int[[1]],3), ' - ', signif(wilcox_test$conf.int[[2]],3), ' SD'))
+  
+  print(density_comp)
+  ggsave(str_c(plot_output_path, 'lvef_stratification_density_thresh',lvef_cutoff,'_',pheno_of_interest,suffix,'.png'),dpi=600)
+  
+  return(input_tb)
+}
+
+pp_of_interest <- c('NTproBNP','TnTStat')
+
+walk(pp_of_interest, ~lvef_stratifier_check(lvef_stratifier_tb, .)) #50% LVEF threshold
+walk(pp_of_interest, ~lvef_stratifier_check(lvef_stratifier_tb, ., lvef_cutoff=60)) #60% LVEF threshold
+
+```
+
+This identifies the median NTproBNP and TnTStat levels in the HCMR individuals with LVEF >50% and <50%.
+
+```{r}
+#Check the non-LVEF NTproBNP levels on raw scale
+#Convert LVEF and NTproBNP and TnTStat back to non-normalised form
+nontransformed_lvef_tb <- left_join(select(transformed_tb,-lvef,-NTproBNP, -TnTStat), select(total_df_notransform_rare, HCR_IDs, lvef, NTproBNP, TnTStat), by='HCR_IDs')
+
+lvef50_cutoff_pp <- map(pp_of_interest, ~lvef_stratifier_check(nontransformed_lvef_tb, ., suffix = '_nontransformedpp')) #50% LVEF threshold
+map(pp_of_interest, ~lvef_stratifier_check(nontransformed_lvef_tb, ., lvef_cutoff=60, suffix = '_nontransformedpp')) #60% LVEF threshold
+
+#Find the median and upper/lower quartiles of HCMR individuals with LVEF >50%
+print(str_c('Median NTproBNP = ',
+  median(filter(lvef50_cutoff_pp[[1]], lvef >=50)$NTproBNP),' [', 
+  quantile(filter(lvef50_cutoff_pp[[1]], lvef >=50)$NTproBNP,0.25),' - ',
+  quantile(filter(lvef50_cutoff_pp[[1]], lvef >=50)$NTproBNP,0.75),'] ',
+  'pg/mL'))
+
+print(str_c('Median TnT = ',
+  median(filter(lvef50_cutoff_pp[[1]], lvef >=50)$TnTStat),' [', 
+  quantile(filter(lvef50_cutoff_pp[[1]], lvef >=50)$TnTStat,0.25),' - ',
+  quantile(filter(lvef50_cutoff_pp[[1]], lvef >=50)$TnTStat,0.75),'] ',
+  'ng/L'))
+
+#Find the median and upper/lower quartiles of HCMR individuals with LVEF >50%
+print(str_c('Median NTproBNP = ',
+  median(filter(lvef50_cutoff_pp[[1]], lvef <50)$NTproBNP),' [', 
+  quantile(filter(lvef50_cutoff_pp[[1]], lvef <50)$NTproBNP,0.25),' - ',
+  quantile(filter(lvef50_cutoff_pp[[1]], lvef <50)$NTproBNP,0.75),'] ',
+  'pg/mL'))
+
+print(str_c('Median TnT = ',
+  median(filter(lvef50_cutoff_pp[[1]], lvef <50)$TnTStat),' [', 
+  quantile(filter(lvef50_cutoff_pp[[1]], lvef <50)$TnTStat,0.25),' - ',
+  quantile(filter(lvef50_cutoff_pp[[1]], lvef <50)$TnTStat,0.75),'] ',
+  'ng/L'))
+
+
+```
+
+
+

@@ -1,0 +1,753 @@
+---
+title: "UKB_PlasmaProteomics_TimeInstancing_SensitivityAnalysis"
+author: "Jonathan Chan"
+date: "2025-04-01"
+output: html_document
+---
+
+# Time Instancing Sensitivity Analysis
+
+This performs sensitivity analysis on the time instancing i.e the max. lag time from blood sample collection before which diagnosis of HCM is assumed to occur.
+
+```{r}
+library(tidyverse)
+library(tictoc)
+library(ggrepel)
+library(ggsignif)
+library(car)
+library(readxl)
+library(limma)
+library(ggnewscale)
+library(survival)
+
+theme_set(theme_classic(base_size=14))
+
+date <- as.POSIXlt(Sys.time(), 'UTC')
+date <- strftime(date, "%Y%m%dT%H:%M:%S%z")
+date <- str_match(date,'^(\\d+)T')[,2]
+```
+
+## Time-Instancing Case Calculator
+
+This is a function used to compute the cases based on the lag time for HCM only.
+We assume 0 time lag for individuals who are HF or T2D.
+
+```{r}
+hcm_case_instance_calculator <- function(input_tb, output_name, threshold_date='bcollection_date_i0', 
+                                         lagtime=5, #Lag time defined in years
+                                         output_folder='DATA/UKB/PROCESSED/5_TimeInstancing/') { 
+  
+  output_tb <- input_tb %>%
+    mutate(case = ifelse(time_length(min_diag_date - eval(parse(text=threshold_date)), unit='year') <= lagtime |  #Assign 5Y status if their minimum date of diagnosis was within n years after attendance. NB This includes i0 cases because they have a time_length of negative because min_diag_Date < date_attend_i0
+                                    time_length(death_date - eval(parse(text=threshold_date)), unit='year') <=lagtime, T,F)) #OR if they had mention of death with ICD10 code of interest & died within n years of attendance
+    
+  print(str_c('There are',nrow(filter(output_tb, case==T)), output_name, 'cases in the UKB who satisfy', lagtime, 'Y criteria', sep=' ' ))
+  
+  if(!dir.exists(output_folder)){dir.create(output_folder, recursive=T)}
+  write_tsv(filter(output_tb, case==T)%>% select(ID), str_c(output_folder, 'ukb_rap_',output_name, '_20240209_',lagtime,'Ycases.tsv'))
+  
+  output_tb <- filter(output_tb, case==T)%>% select(ID) #Only output the filtered HCM cases
+  
+  return(output_tb)
+}
+```
+
+## TB Builder
+
+```{r}
+overall_tb_builder <- function( ukb_cases, #HCM cases in UKB from the particular instance
+                                hcm_instance, #Name of the instance
+                                ukb_pp_list, #List of plasma proteins to compare
+                              ukb_basic_cov_filepath='DATA/UKB/PROCESSED/20240209_ukb_age_sex_htwt_10pcs_dbp_t2d_smoking_cov.tsv',  
+                                ukb_rcmm_cov_filepath='DATA/UKB/PROCESSED/20240209_ukb_rcmm_cov.tsv',
+                                ukb_pp_filepath='DATA/UKB/RAP/PP/ukb_allpp_i0.tsv', 
+                                include_nonCM_panels=T, rcmm_cov=T){
+  
+  #Import in the plasma protein data
+  ukb_pp_data <- read_tsv(ukb_pp_filepath, col_types=rep('n',3006))%>% #All numeric columns
+  select(-`...1`) %>%
+  select(contains('instance_0')) %>% #It contains some instance 2 columns for some reason
+  rename_with(~str_match(.,'\\.(.+)')[,2]) %>%
+  filter(if_any(!'eid', ~!is.na(.))) %>%
+  mutate(non_na_count = rowSums(!is.na(.))-1) %>% #-1 for eid is non-NA
+  #filter(non_na_count > 2) %>%
+  mutate(instance=0) %>%
+  select(eid, instance, ukb_pp_list$ukb_fieldname_equivalent) #Filter for only plasma proteins in the ukb_pp_list
+  
+  #Import in covariate data
+  ukb_20240209_snptest_covariates <- read_tsv(ukb_basic_cov_filepath)
+  if(isTRUE(rcmm_cov)){ukb_20240209_rcmm_cov <- read_tsv(ukb_rcmm_cov_filepath)}
+  
+  #Combine the covariate + pp data
+  ukb_pp_hcm_cov2 <- ukb_pp_data %>%
+  mutate(hcm = ifelse(eid %in% ukb_cases$ID, T, F)) %>%
+  left_join(ukb_20240209_snptest_covariates,by=c('eid'='ID')) %>%
+  select(eid, instance, hcm:t2d, everything()) %>%
+  relocate(bmi, .after='weight') %>% 
+  filter(if_all(age:t2d, ~!is.na(.))) %>%  #Filter out individuals who have NA value for covariates 
+  filter(if_any(all_of(ukb_pp_list$ukb_fieldname_equivalent), ~!is.na(.))) %>% #Filter out individuals who have no non-NA values for all panel proteins 
+  select(where(~any(!is.na(.)))) #Filter for plasma proteins which actually have non-NA values 
+  
+  if(isTRUE(rcmm_cov)){
+    ukb_pp_hcm_cov2 <- ukb_pp_hcm_cov2 %>%
+    left_join(ukb_20240209_rcmm_cov,by=c('eid'='ID')) %>%
+    select(eid, instance, hcm:t2d, Townsend:ldl, everything()) %>% #52092 individuals
+    select(-hdl) %>%  #Ignore HDL for now due to loss of non-NA individuals
+    filter(if_all(c(Townsend,eGFR,ldl), ~!is.na(.)))#Filter out individuals who have NA value for covariates
+  }
+  
+  print(str_c('Number of HCM cases in instance ', hcm_instance, ' = ',sum(ukb_pp_hcm_cov2$hcm)))
+  print(str_c('Number of total individuals with non-NA covariates + at least one non-NA plasma proteins in ', hcm_instance, ' = ',nrow(ukb_pp_hcm_cov2)))
+  
+  return(ukb_pp_hcm_cov2) #This technically doesn't have ranknorm normalisation
+    
+}
+```
+
+# Limma
+```{r}
+limma_dpe <- function(input_tb, protein, predictor_vars='hcm', covar=c('age','sex','bmi','pc1','pc2','pc3','pc4','pc5','dbp','t2d','smoking'), ivnormalise=T){
+  
+  input_tb <- filter(input_tb, !is.na(!!sym(protein))) #Exclude rows with NA values in the response variable
+  
+  if(isTRUE(ivnormalise)){
+    input_tb[[protein]] <- RNOmni::RankNorm(input_tb[[protein]])
+  }
+  
+  #Separate into pheno_df for covariates and predictors and npx_df containing the NPX value for the protein over all individuals
+  pheno_df <- select(input_tb, all_of(predictor_vars),all_of(covar)) %>%
+    mutate(across(all_of(predictor_vars), ~factor(.)))
+  npx_df <- select(input_tb, !!sym(protein))
+  
+  #Need to define the formula i.e model and the model matrix
+  formula <- str_c('~0 +',
+                   str_c(predictor_vars,collapse='+'),
+                   '+',str_c(covar, collapse='+'))
+  design <- model.matrix(eval(parse(text=formula)), pheno_df)
+  
+  #Need to create the matrix array for limma i.e rows = proteins; columns = samples via t() for transpose
+  #Perform the model fitting using weighted least-squares
+  lin_model <- lmFit(t(npx_df), design)
+  
+  #To obtain log-fold changes between groups of the predictor_var i.e hcmTRUE vs. hcmFALSE, you need to obtain the contrast of this fitted linear model
+  if(predictor_vars=='hcm'){
+      contr <- makeContrasts(hcmTRUE - hcmFALSE, levels = design)
+  } else if (predictor_vars=='hf'){
+    contr <- makeContrasts(hfTRUE - hfFALSE, levels = design)
+  }else if (predictor_vars=='rare'){
+    contr <- makeContrasts(rareTRUE - rareFALSE, levels = design)
+  }
+  
+  # Estimate contrast for the protein of interest
+  tmp <- contrasts.fit(lin_model, contr)
+  
+  # Empirical Bayes smoothing of standard errors (shrinks standard errors that are much larger or smaller than those from other proteins towards the average standard error)
+  tmp <- eBayes(tmp)
+  
+  #Return results for that particular protein
+  top.table <- topTable(tmp, sort.by = "P", n = Inf)
+  results <-  as_tibble(top.table) %>%
+    select(-5) %>%
+    mutate(pp=protein) %>%
+    select(pp, everything())
+  
+  return(results)
+}
+```
+
+## Summary Plotting
+```{r}
+summary_plotter_limma <- function(input_tb, output_label='ukb_allpanel', predictor = 'HCM status', output_path=str_c('PLOTS/UKB/1_Case_vs_Control/2_Limma/',instance), pval='bonferroni', fdr_threshold = 0.05, test='Empirical Bayes moderated t-test',xlabel='Log2(Fold-Change)', xlimits=c(-1,2),ylimits=c(0,40), specific_label=F){
+  
+  if (pval=='fdr'){
+    input_tb <- input_tb %>%
+      mutate(P.Value = p.adjust(P.Value, 'fdr'))
+    
+    pval_threshold <- fdr_threshold
+  } else if(pval=='bonferroni'){
+    pval_threshold <- 0.05/nrow(input_tb)
+    
+  } else if (is.numeric(pval)){ #i.e if defining own pvalue threshold to use
+    pval_threshold <- pval
+  }
+  
+  if(isFALSE(specific_label)){
+    input_tb <- input_tb %>% #Only label the ones which reach significance
+      mutate(Label=ifelse(P.Value < pval_threshold,Gene, ''),
+           MTC_significant = ifelse(P.Value < pval_threshold, T, F)) %>%
+      arrange(Label)
+  } else {
+    input_tb <- input_tb %>%
+      mutate(MTC_significant = ifelse(Label=='', F, T)) %>%#Just for downstream code purposes to label some specific points
+      arrange(Label)
+  }
+
+ 
+  #Base plot
+  summary_cont_plot <- ggplot(input_tb, aes(x=logFC, y=-log10(P.Value), col=MTC_significant))+
+    geom_vline(xintercept=0, linetype='dashed')+
+    geom_point()+
+    scale_colour_manual(name=ifelse(isFALSE(specific_label),'MTC Significant','PP of Interest'),values=c('FALSE'='grey','TRUE'='red'))+
+    geom_text_repel(aes(label=Label), nudge_y=3 ,
+                    #nudge_x=0.5,
+                    force =5, max.overlaps=100)+
+    labs(col='Phenotype',shape='Predictor')+
+    scale_x_continuous(n.breaks=10, limits=xlimits)+
+    scale_y_continuous(limits=ylimits)+
+    xlab(xlabel)+
+    ylab('-log10(p-value)')+
+    labs(title=str_c('Summary plot of ', test,' tests for ',length(unique(input_tb$pp)), ' plasma proteins for ', predictor, ' predictor variable'))
+  
+  
+  #Adjust the plot depending on the multiple testing correction
+  if (pval=='bonferroni'){
+    
+    summary_cont_plot <- summary_cont_plot +
+      geom_hline(yintercept=-log10(0.05/nrow(input_tb)), linetype='dashed')+
+      labs(caption=str_c('Bonferroni-corrected p-value threshold = ',signif(0.05/nrow(input_tb),3)))
+    
+  } else if (pval =='fdr'){
+    summary_cont_plot <- summary_cont_plot +
+      geom_hline(yintercept=-log10(pval_threshold), linetype='dashed')+
+      ylab('-log10(Adjusted p-value)')+
+      labs(caption=str_c( fdr_threshold*100, '% FDR correction applied for multiple testing burden'))
+  } else if (is.numeric(pval)){
+    summary_cont_plot <- summary_cont_plot +
+      geom_hline(yintercept=-log10(pval_threshold), linetype='dashed')+
+      labs(caption=str_c('Applied p-value threshold = ',signif(pval_threshold,3)))
+  }
+  
+  print(summary_cont_plot)
+  ggsave(str_c(output_path,output_label,'_summary_plot_',pval,'.png'),summary_cont_plot,dpi=600, width=12, height=6)
+  
+  #Also output a MAplot 
+  ma_plot <- ggplot(input_tb, aes(x = log10(abs(AveExpr)), y = logFC)) +
+    geom_point(aes(col= MTC_significant), alpha=0.5) +
+    geom_text_repel(aes(label=Label))+
+    labs(x = "Log10(Mean Normalised NPX)", y = xlabel) +
+    scale_colour_manual(name='MTC Significant',values=c('FALSE'='grey','TRUE'='red'))+
+    labs(title=str_c('MA plot for ', test, ' in UKB plasma proteins CM panel'))
+
+  print(ma_plot)
+  ggsave(str_c(output_path,output_label,'_ma_plot_',pval,'.png'),ma_plot,dpi=600, width=9, height=6)
+  
+  return(input_tb)
+
+}
+```
+
+
+## Main
+```{r}
+#Earliest collection time for HCM case in UKB = ~ 2006 and end of dataset = 2024 so 18 years is max
+lagtimes <- seq(0,17)
+ukb_pp_list <- read_tsv('DATA/UKB/PROCESSED/ukb_pp_list_allpanel.tsv')
+hf_eid <- read_tsv('DATA/UKB/PROCESSED/1_I0/ukb_rap_HF_20240209_i0cases.tsv')
+
+hcm_diag_tb <- readRDS('DATA/UKB/PROCESSED/3_TOTAL/ukb_diagnosis_dates_minimum.rds')
+bcollection_date <- read_tsv('DATA/UKB/RAP/Cases/2024_02_09_allUKB_BloodCollection_Time.tsv')%>%
+  dplyr::rename(ID=eid, bcollection_date_i0=p21842_i0) %>%
+  mutate(bcollection_date_i0=as_date(bcollection_date_i0))
+hcm_diag_tb <- left_join(hcm_diag_tb, bcollection_date, 'ID')
+
+main <- function(lagtime,  #Lagtime to test in years
+                  ukb_pp_list, #PPs to include in analysis,
+                  hcm_diag_tb, #This is the 
+                  hf_eid, #IDs of HF cases (i0)
+                  ukb_basic_cov_filepath='DATA/UKB/PROCESSED/20240209_ukb_age_sex_htwt_10pcs_dbp_t2d_smoking_cov.tsv',  
+                  ukb_rcmm_cov_filepath='DATA/UKB/PROCESSED/20240209_ukb_rcmm_cov.tsv',
+                  ukb_pp_filepath='DATA/UKB/RAP/PP/ukb_allpp_i0.tsv', 
+                  pp_scaling='ranknorm',
+                  rcmm_cov=T,
+                  include_nonCM_panels=T,
+                  cc_output_basepath = 'OUTPUT/UKB/PLOTS/1_Case_vs_Control/2_Limma/0_TimeInstancing/',
+                  limma_run=T){
+  
+  hcm_cases <- hcm_case_instance_calculator(hcm_diag_tb, 'HCM', lagtime=lagtime)
+  
+  ukb_pp_cov_hcm <- overall_tb_builder(hcm_cases, #HCM cases in UKB from the particular instance
+                                str_c(lagtime, 'Y', collapse = ''), #Name of the instance
+                                ukb_pp_list, #List of plasma proteins to compare
+                                ukb_basic_cov_filepath,  
+                                ukb_rcmm_cov_filepath,
+                                ukb_pp_filepath, 
+                                include_nonCM_panels, rcmm_cov)
+  
+  pp <- ukb_pp_list$ukb_fieldname_equivalent[ukb_pp_list$ukb_fieldname_equivalent %in% colnames(ukb_pp_cov_hcm)] %>%  #In case any PP are removed due to lack of non-NA values
+  unique()
+  
+  #Run case-control analysis for HCM (including HF) vs. non-HF (i0) and non-HCM (lagtime) controls
+  #Only run this CC analysis (and not subgroup ones) because limma is a bit slow
+  
+  cc_tb <- ukb_pp_cov_hcm %>%
+    mutate(hcm = case_when(eid %in% hcm_cases$ID ~ T, #HCM cases independent of HF status
+                           !eid %in% hcm_cases$ID & !eid %in% hf_eid$ID ~ F, #Non-HF non-HCM controls
+                           T~NA)) %>% #non-HCM and HF 
+    filter(!is.na(hcm))
+  
+  print(str_c('At lagtime ', lagtime, 'Y, number of HCM cases (incl. those with HF) = ', sum(cc_tb$hcm==T), ' and non-HCM/HF controls = ', sum(cc_tb$hcm==F)))
+  
+
+  if (isTRUE(rcmm_cov)){  #If using the extended covariate list suggested by Rob Clarke and Mohsen
+    extra_folders <- 'rcmm_cov/'
+    covars <- c('age','sex','bmi','pc1','pc2','pc3','pc4','pc5','dbp','t2d','smoking','Townsend','eGFR', 'ldl')
+  } else {
+    covars <- c('age','sex','bmi','pc1','pc2','pc3','pc4','pc5','dbp','t2d','smoking')
+  }
+  if(isTRUE(include_nonCM_panels)){ extra_folders <- str_c(extra_folders, 'allpanels/')} 
+  
+  path <- str_c(cc_output_basepath,'/HCM/', extra_folders) #Define the folder for output of plots and tabular data
+  if(!dir.exists(path)){dir.create(path, recursive=T)}
+  
+  if(isTRUE(limma_run)){
+    limma_hcm <- map(pp, ~limma_dpe(cc_tb,., covar=covars)) %>% bind_rows()
+    
+    limma_hcm <- left_join(limma_hcm, select(ukb_pp_list, Gene=Target, ukb_fieldname_equivalent), by=c('pp'='ukb_fieldname_equivalent')) %>% unique()
+    write_tsv(limma_hcm, str_c(path,lagtime, 'Y_lag_limma_results.tsv'))
+    print(str_c('Written output limma_results.tsv for lagtime ', lagtime, 'Y'))
+    
+    pp_vs_hcm_marginal_bonferroni_summarytb_limma <- summary_plotter_limma(limma_hcm, output_label = str_c(lagtime, 'Y_lag_allpp_vs_hcm'),predictor = 'HCM status',output_path=path, xlimits=c(-1,2),ylimits=c(0,50)) 
+    
+    #Also for 5%FDR and 1%FDR
+    pp_vs_hcm_marginal_fdr5_summarytb_limma <- summary_plotter_limma(limma_hcm, output_label = str_c(lagtime, 'Y_lag_allpp_vs_hcm'),predictor = 'HCM status',output_path=path, pval = 'fdr', xlimits=c(-1,2),ylimits=c(0,50)) 
+    
+    rm(ukb_pp_cov_hcm, path)
+  
+  return(limma_hcm)
+  } else{
+    return(c(sum(cc_tb$hcm==T), sum(cc_tb$hcm==F)))
+  }
+  
+
+}
+
+# walk(lagtimes, ~main(., ukb_pp_list, hcm_diag_tb, hf_eid)) #Run limma
+perlagtime_tb <- map(lagtimes, ~main(., ukb_pp_list, hcm_diag_tb, hf_eid, limma_run=F)) #Don't run limma and only output the tbs
+```
+
+# Case/Control Number for each Lagtime
+
+```{r}
+# case_numbers <- map_int(perlagtime_tb, ~lambda x(sum(x$hcm==T))) %>% bind_cols('Lagtime' = seq(0,17))
+# control_numbers <- map_int(perlagtime_tb, ~lambda x(sum(x$hcm==F))) %>% bind_cols('Lagtime' = seq(0,17))
+
+case_numbers <- "24,29,32,34,35,42,47,52,54,59,72,79,88,95,98,99,100"
+control_numbers <-"49114,49109,49106,49104,49103,49096,49092,49088,49086,49081,49069,49062,49053,49046,49043,49042,49041"
+
+n_tb <- bind_cols('lagtime'=seq(0,16),as.numeric(str_split_1(case_numbers,',')), as.numeric(str_split_1(control_numbers,',')))
+n_tb <- mutate(n_tb,lagtime = as_factor(lagtime))
+colnames(n_tb) <- c('lagtime', 'case_n','control_n')
+
+#Plot of case number over lagtime
+plot_output_path <- 'OUTPUT/UKB/PLOTS/1_Case_vs_Control/2_Limma/0_TimeInstancing/HCM/rcmm_cov/allpanels/'
+
+
+n_plotter <- function(input_tb, plot_output_path, column_name='case_n'){
+  
+  if (column_name=='case_n'){label <- 'Cases'} else if (column_name=='control_n'){label <- 'Controls'}
+  
+  max_n = max(input_tb[[column_name]])
+  
+  n_plot <- ggplot(input_tb,aes(x=lagtime, y=.data[[column_name]]))+
+    geom_col()+
+    xlab('Lag Time Assumed (Years)')+
+    ylab(str_c('Number of ', label))+
+    geom_text(aes(label=.data[[column_name]]), nudge_y=max_n/20) #Dynamic height adjustment to 1/20 of the max value
+  
+  print(n_plot)
+  ggsave(str_c(plot_output_path, label,'_n.png'), dpi=600, width=9, height = 3)
+  
+}
+
+n_plotter(n_tb, plot_output_path)
+# n_plotter(n_tb, plot_output_path, 'control_n')
+```
+
+
+# Case-Control Comparison of Different Lagtimes 
+
+```{r import_limma}
+limma_importer <- function(filedir){
+  f <- list.files(filedir, full.names=F, pattern='limma_results')
+  lagtimes <- as.numeric(str_match(f, '(\\d{1,2})Y_lag')[,2])
+  
+  results <- map2(str_c(filedir,f), lagtimes, ~read_tsv(.x) %>% mutate(lag=.y)) %>% bind_rows()
+  return(results)
+}
+
+lag_results <- limma_importer('OUTPUT/UKB/PLOTS/1_Case_vs_Control/2_Limma/0_TimeInstancing/HCM/rcmm_cov/allpanels/')
+```
+
+## Adjust for Inflation in Test Statistics
+
+```{r}
+#This checks for the lambda inflation factor for each of the lag times tested
+lambda_checker <- function(results_df){
+
+  # This quantifies the deviation you see in the Q-Q plot.
+  chisq_stats <- qchisq(results_df$P.Value, df = 1, lower.tail = FALSE) #This step recomputes the Chi-sq test statistic from the p-value itself assuming the p-value follows a Chi-sq distribution with df=1
+  lambda <- median(chisq_stats) / qchisq(0.5, df = 1)
+
+  return(lambda)
+}
+
+lambdas <- map(lagtimes, ~lambda_checker(filter(lag_results, lag == .)))
+names(lambdas) <- str_c(lagtimes, ' Y')
+
+print(sum(lambdas > 1.1, na.rm=T)) #How many lag times have lambda > 1.1
+```
+
+```{r}
+inflation_adjuster <- function(limma_results, lambda){
+
+  #This readjusts the p-values for inflation adjustment by computing the Chi-squared test statistic from the p-value and then dividing by lambda -> recompute the p-values
+  limma_results <- limma_results %>%
+    mutate(lambda_adjusted_pvalue = pchisq(qchisq(limma_results$P.Value, df = 1, lower.tail = FALSE)/lambda,df=1,lower.tail=FALSE))
+  
+  return(limma_results)
+}
+
+lag_results_inflationadj <- map2(lagtimes, lambdas, ~inflation_adjuster(filter(lag_results, lag == .x), .y))
+
+#Convert list back to a single tibble
+lag_results <- lag_results_inflationadj %>% bind_rows()
+```
+
+Extract out all plasma proteins that are 5% FDR-significant in at least one time lag instance.
+
+```{r}
+lag_results <- lag_results %>%
+  group_by(lag) %>%
+  mutate(fdr_pval = p.adjust(lambda_adjusted_pvalue, method='BH')) %>%
+  ungroup() %>%
+  mutate(fdr5_pass_all_lags = ifelse(fdr_pval <= 0.05, T, F)) %>%
+  group_by(pp) %>%
+  mutate(num_instances_sig = sum(fdr_pval <= 0.05)) %>%
+  ungroup() %>%
+  mutate(pp = reorder(factor(pp,ordered=T), num_instances_sig)) %>%
+  mutate(ln_abs_beta = log1p(abs(B))) %>%
+  mutate(neglog10_fdr_pval = -log10(fdr_pval))
+
+fdr5_proteins_all_lag <- unique(filter(lag_results, fdr5_pass_all_lags==T)$pp) #5 plasma proteins are FDR5-sig. in at least one time instance
+```
+
+Output a plot showing how the betas and FDR-adjusted(-log10) p-values change as a function of the time lag.
+
+```{r}
+timelag_plotter <- function(input_tb, metric, metric_name, pp_of_interest, output_folder, fc_ylims = c(0,2), suffix=''){
+  
+  plot_tb <- input_tb %>%
+    filter(pp %in% pp_of_interest)
+  
+  #Heatmap
+  heatmap_plot <- ggplot(plot_tb, aes(x=lag, y=pp, fill=!!sym(metric)))+
+    geom_tile()+
+    viridis::scale_fill_viridis(direction=ifelse(metric=='fdr_pval', -1, 1))+
+    xlab('Lag Time Assumed (Years)')+
+    ylab('Plasma Protein')+
+    labs(title = str_wrap(str_c('Heatmap of plasma proteins passing 5% FDR in at least one instance over ', length(unique(plot_tb$lag)), 'lag time instances with colour = ', metric_name)))+
+    labs(fill=metric_name)
+
+  print(heatmap_plot)
+  ggsave(str_c(output_folder, 'summary_',metric, '_heatmap',suffix,'.png'), heatmap_plot, dpi=600, width = 6, height = 6)
+  
+  #Line plot - facetted by the number of time instances in which the protein is FDR-significant
+  #Add labels to each line at the last instance
+  max_instance <- max(plot_tb$lag)
+  plot_tb <- plot_tb %>%
+    mutate(Label = ifelse(lag==max_instance, as.character(pp), ''))
+  
+    # Get unique facet levels
+  n_sig_levels <- unique(plot_tb$num_instances_sig)
+  
+  # Base plot
+  p <- ggplot()
+  
+  # Loop over each facet level and add a new layer
+  for (n in n_sig_levels) {
+    p <- p +
+      geom_step(data = plot_tb %>% filter(num_instances_sig == n), 
+                aes(x = lag, y = !!sym(metric), color = pp)) +
+      geom_text_repel(data = plot_tb %>% filter(num_instances_sig == n), 
+                aes(x = lag, y = !!sym(metric), color = pp, label=Label),
+                force=3, max.overlaps=100)+
+      scale_color_brewer(palette = "Paired") +
+      scale_x_continuous(breaks = seq(from = min(plot_tb$lag), to = max(plot_tb$lag), by = 2))+
+      xlab('Lag Time Assumed (Years)')+
+      ylab(metric_name)+
+      theme(legend.position = "none")+
+      # guides(color = guide_legend(title = "Plasma Protein", direction = 'horizontal', position='bottom'))+
+      new_scale_color()  # Reset colors for the next facet
+    
+    if(metric == 'logFC'){
+      p <- p+
+        scale_y_continuous(limits=fc_ylims)
+    }
+
+    if(metric=='fdr_pval'){
+      p <- p+
+        geom_hline(yintercept=0.05,linestyle='dashed', alpha=0.25, col='red', linetype='dashed')
+    } else if (metric=='neglog10_fdr_pval'){
+      p<-p+
+        geom_hline(yintercept=-log10(0.05),linestyle='dashed', alpha=0.25, col='red', linetype='dashed')
+  }
+  
+  # Add facets and theme
+  p <- p + facet_wrap(~num_instances_sig, scales = "fixed", ncol=4)+
+        labs(title=str_c("Line plot of plasma proteins' " , metric_name, ' over ', length(unique(plot_tb$lag)),' lag time instances facetted by number of lag times in which it is 5% FDR-significant'))
+    }
+  
+  print(p)
+  
+  ggsave(str_c(output_folder, 'summary_',metric, '_lineplot',suffix,'.png'), p, dpi=600, width = 12, height = 5)
+  
+}
+
+timelag_plotter(lag_results, 'logFC', 'log2(Fold-Change)',fdr5_proteins_all_lag, 'OUTPUT/UKB/PLOTS/1_Case_vs_Control/2_Limma/0_TimeInstancing/HCM/rcmm_cov/allpanels/')
+# timelag_plotter(lag_results, 'ln_abs_beta', 'Ln(|Beta|)',fdr5_proteins_all_lag, 'OUTPUT/UKB/PLOTS/1_Case_vs_Control/2_Limma/0_TimeInstancing/HCM/rcmm_cov/allpanels/')
+# timelag_plotter(lag_results, 'fdr_pval', 'FDR-adjusted p-value',fdr5_proteins_all_lag, 'OUTPUT/UKB/PLOTS/1_Case_vs_Control/2_Limma/0_TimeInstancing/HCM/rcmm_cov/allpanels/')
+timelag_plotter(lag_results, 'neglog10_fdr_pval', '-log10(FDR-adjusted p-value)',fdr5_proteins_all_lag, 'OUTPUT/UKB/PLOTS/1_Case_vs_Control/2_Limma/0_TimeInstancing/HCM/rcmm_cov/allpanels/')
+
+#Ignore NTproBNP and NPPB
+# timelag_plotter(lag_results, 'logFC', 'log2(Fold-Change)',fdr5_proteins_all_lag[!fdr5_proteins_all_lag %in% c('ntprobnp','nppb')], 'OUTPUT/UKB/PLOTS/1_Case_vs_Control/2_Limma/0_TimeInstancing/HCM/rcmm_cov/allpanels/', suffix='_wo_NTproBNP_NPPB')
+```
+
+# Incident Cox HCM Diagnosis
+
+```{r}
+multivariate_cox <- function(input_tb, marginal_predictor, covariates, status, outcome_var, outcome_levels, print_summary=T,return_predictor_results_only=T, return_model=F){ #Return only the coefficient and p-values for the marginal_predictor
+  
+  x <- str_c(c(covariates,marginal_predictor), collapse='+')
+  y <- str_c('Surv(',outcome_var,',',status,')')
+  formula <- as.formula(paste(y,'~',x))
+  
+  multivariate_cox <- coxph(formula, data=input_tb)
+  if(isTRUE(print_summary)){
+    print(summary(multivariate_cox))
+  }
+  
+  x<- summary(multivariate_cox)
+  
+  if(isTRUE(return_model)){
+    return(multivariate_cox)
+  }
+  
+  if(isFALSE(return_predictor_results_only)){
+  
+  p.value<-signif(x$coef[1:nrow(x$coef),5], digits=3)
+  beta<-signif(x$coef[1:nrow(x$coef),1], digits=3);#coeficient beta
+  HR <-signif(x$coef[1:nrow(x$coef),2], digits=3);#exp(beta) = hazard ratio
+  HR.confint.lower <- signif(x$conf.int[,"lower .95"], 3)
+  HR.confint.upper <- signif(x$conf.int[,"upper .95"],3)
+  se_beta <- signif(x$coef[1:nrow(x$coef),3], digits=3)
+  vars <- rownames(x$coef)
+    
+  } else{
+      p.value<-signif(x$coef[nrow(x$coef),5], digits=3)
+  beta<-signif(x$coef[nrow(x$coef),1], digits=3);#coeficient beta
+  HR <-signif(x$coef[nrow(x$coef),2], digits=3);#exp(beta) = hazard ratio
+  HR.confint.lower <- signif(x$conf.int[,"lower .95"][nrow(x$coef)], 3)
+  HR.confint.upper <- signif(x$conf.int[,"upper .95"][nrow(x$coef)],3)
+  se_beta <- signif(x$coef[nrow(x$coef),3], digits=3)
+  vars <- rownames(x$coef)[nrow(x$coef)]
+
+  }
+  
+  res<-bind_cols(vars,beta, se_beta, HR, HR.confint.lower, HR.confint.upper, p.value) %>%
+    mutate(predictor=str_to_upper(vars)) %>%
+    mutate(outcome = factor(
+      str_to_upper(str_match(outcome_var,'(.+)_age')[,2]),levels=outcome_levels, ordered=T
+    ))
+  
+  names(res)<-c('var',"beta",'se_beta', "HR", "Lower_95CI_HR","Upper_95CI_HR", 
+            "p.value", 'predictor','outcome')
+  
+  return(res)
+}
+
+multivariate_coxph_plotter <- function(multivariate_results, plot_output_path, output_name, pp_scaling, FDR=5, specific_label=F, ylimits=''){
+  
+  if (!is.numeric(FDR)){ #Apply Bonferroni
+    pval_threshold = 0.05/nrow(multivariate_results)
+    mtc <- 'Bonferroni'
+  } else{
+    multivariate_results <- mutate(multivariate_results, p.value=p.adjust(p.value, method='BH'))
+    pval_threshold <- FDR/100
+    mtc <- str_c('FDR ',FDR, '%',sep='')
+  }
+  
+  if(isFALSE(specific_label)){
+    multivariate_results <- multivariate_results %>% #Only label the ones which reach significance
+      mutate(Label=ifelse(p.value < pval_threshold,Label, ''),
+           MTC_significant = ifelse(p.value < pval_threshold, T, F)) %>%
+      arrange(Label)
+  } else {
+    multivariate_results <- multivariate_results %>%
+      mutate(MTC_significant = ifelse(Label=='', F, T)) %>%#Just for downstream code purposes to label some specific points
+      arrange(Label)
+  }
+  
+  multivariate_plot <- ggplot(multivariate_results, aes(HR,-log10(p.value), col=MTC_significant))+
+    geom_vline(xintercept=1, linetype='dashed',alpha=0.5)+
+    geom_hline(yintercept=-log10(pval_threshold), linetype='dashed', alpha=0.5)+
+    geom_point(alpha=0.75)+
+    scale_colour_manual(name=ifelse(isFALSE(specific_label),'MTC Significant','PP of Interest'),values=c('FALSE'='grey','TRUE'='red'))+
+    geom_text_repel(aes(label=Label), nudge_y=3, force = 5, max.overlaps=40)+
+    #geom_errorbarh(aes(xmin=Lower_95CI_HR, xmax=Upper_95CI_HR,col=predictor),alpha=0.75, height=0.1)+
+    xlab(ifelse(isFALSE(pp_scaling),'Hazard Ratio', 'Hazard Ratio per SD'))+
+    ylab(ifelse(mtc=='Bonferroni','-log10 (Wald-test p value)', '-log10 (Adjusted Wald-test p value)'))+
+    scale_x_continuous(n.breaks=10)+
+    labs(title=str_wrap(str_c('Multivariate Cox Regression analysis for ', nrow(multivariate_results), ' plasma protein predictors')),caption=str_c(mtc, ' p-value Threshold Indicated'))+
+    theme(legend.position="right")
+  
+  if(!identical(ylimits,'')){
+    multivariate_plot <- multivariate_plot+
+      scale_y_continuous(limits=ylimits)
+  }
+  
+  print(multivariate_plot)
+  ggsave(str_c(plot_output_path, 'cox_multivariate_', output_name,'.png'), dpi=600, width=9, height=6)
+  
+  return(multivariate_results)
+}
+```
+
+## Main2
+
+```{r}
+ukb_outcomes <- read_tsv('../../HCM_Severity/DATASETS/UKB/RAP/Outcomes/Processed/allukb_outcome_ages.tsv')
+ukb_cases_total <- read_tsv('DATA/UKB/RAP/Cases/ukb_rap_HCM_20240209.csv')
+
+main2 <- function(lagtime,  #Lagtime to test in years
+                  ukb_pp_list, #PPs to include in analysis,
+                  ukb_outcomes,
+                  hcm_diag_tb, #This contains the minimum diagnosis dates
+                  ukb_cases_total,
+                  ukb_basic_cov_filepath='DATA/UKB/PROCESSED/20240209_ukb_age_sex_htwt_10pcs_dbp_t2d_smoking_cov.tsv',  
+                  ukb_rcmm_cov_filepath='DATA/UKB/PROCESSED/20240209_ukb_rcmm_cov.tsv',
+                  ukb_pp_filepath='DATA/UKB/RAP/PP/ukb_allpp_i0.tsv', 
+                  pp_scaling='ranknorm',
+                  rcmm_cov=T,
+                  include_nonCM_panels=T,
+                  output_basepath = 'OUTPUT/UKB/PLOTS/5_CoxHCMDiag/0_TimeInstancing/'){
+  
+  hcm_cases <- hcm_case_instance_calculator(hcm_diag_tb, 'HCM', lagtime=lagtime)
+  
+  ukb_pp_cov_hcm <- overall_tb_builder(hcm_cases, #HCM cases in UKB from the particular instance
+                                str_c(lagtime, 'Y', collapse = ''), #Name of the instance
+                                ukb_pp_list, #List of plasma proteins to compare
+                                ukb_basic_cov_filepath,  
+                                ukb_rcmm_cov_filepath,
+                                ukb_pp_filepath, 
+                                pp_scaling,include_nonCM_panels, rcmm_cov)
+  
+    pp <- ukb_pp_list$ukb_fieldname_equivalent[ukb_pp_list$ukb_fieldname_equivalent %in% colnames(ukb_pp_cov_hcm)] %>%  #In case any PP are removed due to lack of non-NA values
+  unique()
+  
+  #Make further changes to the ukb_pp_cov_hcm to prepare it for CoxHCMdiag
+    if (pp_scaling == 'scale'){
+    pp_tb <- ukb_pp_cov_hcm %>% select(all_of(pp)) %>%
+      scale()
+    
+    ukb_pp_cov_hcm <- ukb_pp_cov_hcm %>%
+      select(-all_of(pp)) %>%
+      bind_cols(pp_tb)
+      
+    rm(pp_tb)
+    
+  }else if (pp_scaling == 'ranknorm'){
+    ukb_pp_cov_hcm <- ukb_pp_cov_hcm %>%
+      mutate(across(all_of(pp), ~ replace(., !is.na(.), RNOmni::RankNorm(.[!is.na(.)]))))
+  }
+  
+  ukb_diag_cox_tb <- ukb_pp_cov_hcm %>%
+  left_join(select(ukb_outcomes,ID, lost_age, death_age, age_attend_i0, dob_approx), by=c('eid'='ID')) %>%
+  left_join(select(hcm_diag_tb, ID,min_diag_date2), by=c('eid'='ID'))
+
+  ukb_diag_cox_tb <- ukb_diag_cox_tb %>%
+    filter(!eid %in% hcm_cases$ID) %>% #Filter out HCM cases who were diagnosed prior to the blood sample collection date + lag time assumed
+    mutate(datasetversion_age = time_length(ymd('2024-02-09') - dob_approx, unit='year')) %>%
+    mutate(incidenthcm_status = ifelse (eid %in% ukb_cases_total[['0']], T,F)) %>% #Add in status
+    rowwise() %>%
+    mutate(incidenthcm_age = (ifelse(incidenthcm_status==T, time_length(min_diag_date2-dob_approx, unit='year'), min(datasetversion_age, death_age, lost_age, na.rm=T)))) %>% #Add in incident_hcm_age = if status, that will be min_diag_date2 and if not, then it will be the age at dataset version or lost to followup
+    ungroup()
+  
+  if (isTRUE(rcmm_cov)){  #If using the extended covariate list suggested by Rob Clarke and Mohsen
+    extra_folders <- 'rcmm_cov/'
+    covars <- c('age','sex','bmi','pc1','pc2','pc3','pc4','pc5','dbp','t2d','smoking','Townsend','eGFR', 'ldl')
+  } else {
+    covars <- c('age','sex','bmi','pc1','pc2','pc3','pc4','pc5','dbp','t2d','smoking')
+  }
+  if(isTRUE(include_nonCM_panels)){ extra_folders <- str_c(extra_folders, 'allpanels/')} 
+  
+  path <- str_c(output_basepath, extra_folders) #Define the folder for output of plots and tabular data
+  if(!dir.exists(path)){dir.create(path, recursive=T)}
+  
+    
+  multivariate_cox_results <- c(
+    map(pp, ~multivariate_cox(ukb_diag_cox_tb,.,covars,'incidenthcm_status','incidenthcm_age', outcome_levels=c('INCIDENTHCM'), print_summary = F))
+  ) %>%
+    bind_rows() %>%
+    filter(!is.na(p.value))
+  
+  multivariate_cox_results <- multivariate_cox_results %>%
+    left_join(dplyr::select(ukb_pp_list,ukb_fieldname_equivalent,Target), by=c('var'='ukb_fieldname_equivalent')) %>%
+    unique() %>%
+    dplyr::rename(Label=Target)
+  
+  saveRDS(multivariate_cox_results, str_c(path,'/mvCox_results_pp',pp_scaling,'_',lagtime, 'Y.rds'))
+  
+  mvcox_incidentHCM_fdr5 <- multivariate_coxph_plotter(multivariate_cox_results, path, str_c('pp_incidentHCMdiag_fdr5_pp',pp_scaling,'_',lagtime,'Y'), pp_scaling=pp_scaling)
+  multivariate_coxph_plotter(multivariate_cox_results, path, str_c('pp_incidentHCMdiag_fdr1_pp',pp_scaling,'_',lagtime,'Y'), FDR=1, pp_scaling=pp_scaling)
+  multivariate_coxph_plotter(multivariate_cox_results, path, str_c('pp_incidentHCMdiag_bonferroni_pp', pp_scaling,'_',lagtime,'Y'), FDR=F, pp_scaling=pp_scaling)
+  
+  #Write out 
+  write_tsv(dplyr::select(filter(ukb_pp_list, ukb_fieldname_equivalent %in% filter(mvcox_incidentHCM_fdr5, MTC_significant==T)$var),UniProt),
+            str_c(path,'fdr5_pass_uniprotIDs_pp',pp_scaling,'_',lagtime,'Y.tsv'), col_names=F)
+  
+}
+
+lagtimes <- c(2,3,4,seq(6,17))
+walk(lagtimes, ~main2(., ukb_pp_list, ukb_outcomes, hcm_diag_tb, ukb_cases_total))
+
+```
+
+# Incident Comparison
+```{r}
+diagrds_importer <- function(filedir){
+  f <- list.files(filedir, full.names=F, pattern='mvCox_results')
+  lagtimes <- as.numeric(str_match(f, '_(\\d{1,2})Y.rds')[,2])
+  
+  results <- map2(str_c(filedir,f), lagtimes, ~readRDS(.x) %>% mutate(lag=.y)) %>% bind_rows()
+  return(results)
+}
+
+cox_lag_results <- diagrds_importer('OUTPUT/UKB/PLOTS/5_CoxHCMDiag//0_TimeInstancing/rcmm_cov/allpanels/')
+
+#Filter out outlier year of 14Y time instance (some instability in Cox regression likely)
+cox_lag_results <- cox_lag_results %>%
+  filter(lag <= 12)
+
+cox_lag_results <- cox_lag_results %>%
+  # dplyr::rename(pp=var) %>%
+  group_by(lag) %>%
+  mutate(fdr_pval = p.adjust(p.value, method='BH')) %>%
+  ungroup() %>%
+  mutate(fdr5_pass_all_lags = ifelse(fdr_pval <= 0.05, T, F)) %>%
+  group_by(pp) %>%
+  mutate(num_instances_sig = sum(fdr_pval <= 0.05)) %>%
+  ungroup() %>%
+  mutate(pp = reorder(factor(pp,ordered=T), num_instances_sig)) %>%
+  mutate(ln_abs_beta = log1p(abs(beta))) %>%
+  mutate(neglog10_fdr_pval = -log10(fdr_pval))
+
+fdr5_Cox_pp_all_lag <- as.character(unique(filter(cox_lag_results, fdr5_pass_all_lags==T)$pp)) #11 plasma proteins are FDR5-sig. in at least one time instance
+# fdr5_Cox_pp_all_lag_thresh2 <- as.character(unique(filter(cox_lag_results, num_instances_sig >=2)$pp)) #7 plasma proteins pass FDR significance in at least 2 time instances
+```
+
+```{r}
+timelag_plotter(cox_lag_results, 'beta', 'Beta',fdr5_Cox_pp_all_lag, 'OUTPUT/UKB/PLOTS/5_CoxHCMDiag/0_TimeInstancing/rcmm_cov/allpanels/')
+timelag_plotter(cox_lag_results, 'HR', 'Hazard Ratio',fdr5_Cox_pp_all_lag, 'OUTPUT/UKB/PLOTS/5_CoxHCMDiag/0_TimeInstancing/rcmm_cov/allpanels/')
+```
+
+

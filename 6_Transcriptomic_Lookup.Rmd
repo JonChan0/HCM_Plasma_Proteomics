@@ -1,0 +1,123 @@
+---
+title: "6_Transcriptomic_Lookup"
+author: "Jonathan Chan"
+date: "2025-07-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+rm(list=ls())
+```
+
+```{r}
+genes_of_interest <- c(
+  'ACE2',
+  'TNNI3',
+  'NPPB',
+  'HRC',
+  'LTBP2',
+  'STC2',
+  'ANGPT2',
+  'F7',
+  'TNNT2'
+)
+```
+
+# scRNA-seq
+
+## Chaffin et al, 2022
+
+```{r}
+chaffin22 <- read_excel('DATA/Transcriptomic/Chaffin22/2021-02-03277C-ST7.HCMvsNF.xlsx')
+
+chaffin22_filtered <- chaffin22 %>%
+  filter(Gene %in% genes_of_interest) %>%
+  filter(`Background\r\nContamination\r\nFlag` != 1)
+
+chaffin22_filtered <- chaffin22_filtered %>%
+  select(Gene,`Cell Type`, 10:13, 15, 17)
+```
+
+## Lu et al, 2024 (CMs Only)
+
+```{r}
+lu24 <- read_excel('DATA/Transcriptomic/Lu24/cpr13557-sup-0003-tables2.xlsx')
+colnames(lu24) <- lu24[1,1:7]
+
+lu24_filtered <- lu24 %>%
+  filter(gene!= 'gene') %>%
+  select(gene, cluster, everything())%>%
+  filter(gene %in% genes_of_interest)
+```
+
+# Bulk RNA-Seq
+
+## Garmany et al, 2023
+
+```{r}
+garmany23 <- read_excel('DATA/Transcriptomic/Garmany23/edgeR_results.xlsx')
+
+garmany23_filtered <- garmany23 %>%
+  select(GeneName, log2baseMean:DE) %>%
+  filter(GeneName %in% genes_of_interest) 
+# %>%
+#   filter(DE != 'None')
+  
+garmany23_plot_tb <- garmany23_filtered %>%
+  select(GeneName,log2FoldChange,pval,padj,DE)
+
+```
+
+## Gao et al, 2024
+
+```{r}
+gao24 <- read_excel('DATA/Transcriptomic/Gao24/DEG_AdultControl_HCMPatient.xlsx',sheet = 1) %>% 
+  bind_rows(read_excel('DATA/Transcriptomic/Gao24/DEG_AdultControl_HCMPatient.xlsx', sheet=2))
+
+gao24_filtered <- gao24 %>%
+  filter(gene_name %in% genes_of_interest) %>%
+  select(gene_name, logFC, Pvalue, FDR, cluster, mean_exp_CON, mean_exp_HCM)
+
+```
+
+## Gao et al, 2020
+
+```{r}
+gao20 <- read_excel('DATA/Transcriptomic/Gao20/DEA_Gao20.xlsx')
+
+gao20_filtered <- gao20 %>%
+  select(1:20)
+colnames(gao20_filtered) <- gao20[2,1:20]
+gao20_filtered <- gao20_filtered[3:nrow(gao20_filtered),1:20]
+gao20_filtered <- gao20_filtered %>%
+  select(gene_name,log2FoldChange:padj) %>%
+  filter(gene_name %in% genes_of_interest)
+
+doublecheck <- filter(gao20, `...3`=='ANGPT2')
+sum(str_detect(colnames(doublecheck),'^N|^sc')) #These correspond to the 9 controls
+sum(str_detect(colnames(doublecheck),'^HCM')) #These correspond to the 28 HCM cases
+control_mean <- mean(as.numeric(doublecheck[str_detect(colnames(doublecheck),'^N|^sc')]), na.rm=T)
+hcm_mean <- mean(as.numeric(doublecheck[str_detect(colnames(doublecheck),'^HCM')]),na.rm=T)
+
+#hcm_mean > control_mean for these two which means that the test was done for controls vs cases (i.e OG data refers to downregulated in CONTROLS)
+
+gao20_filtered <- gao20_filtered %>% #Harmonise so that the test is for cases vs. controls (i.e flip the magnitude i.e log(Y/X) = -log(X/Y))
+  mutate(log2FoldChange=-as.numeric(log2FoldChange))
+rm(doublecheck)
+```
+## Kiselev et al, 2022
+
+```{r}
+kiselev22 <- read_excel('DATA/Transcriptomic/Kiselev22/Tables_S1-S6.xlsx', sheet='Table S2', skip=1)
+
+#The logFC test refers to the HCM vs. controls
+kiselev22_filtered <- kiselev22 %>%
+  filter(gene %in% genes_of_interest)
+
+#Welp - NONE DE
+```
+
+
