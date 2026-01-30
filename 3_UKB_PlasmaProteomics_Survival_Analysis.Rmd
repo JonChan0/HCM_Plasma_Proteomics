@@ -1,0 +1,1707 @@
+---
+title: "Univariate Survival Analysis - UKB PPP"
+author: "Jonathan Chan"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide   
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(viridis)
+library(ggtext)
+library(plotly)
+library(ggrepel)
+library(survival)
+library(survminer)
+library(matrixStats)
+rm(list=ls())
+
+theme_set(theme_classic(base_size=14))
+```
+
+This performs univariate survival analysis using categorical variables on certain subsets within the UKB PPP subset.
+
+## Import Predictor Data
+
+```{r}
+rcmm_cov<- T
+
+instance <- '3_TOTAL'
+# instance <- '1_I0'
+# instance <- '2_5Y'
+# instance <- '4_NEGTOTAL' #Those who are never HCM or HF patients
+
+# pp_scaling <- 'scale' #This flag is used if you want to flag the scales via scale()
+pp_scaling <- 'ranknorm'
+
+#This is derived from `UKB_Plasma_Proteomics_Analysis.Rmd` and contains the HCM cases corresponding to the particular instance (I0; 5Y or Total)
+if(isTRUE(rcmm_cov)){
+  ukb_pp_hcm_cov2 <- read_tsv(str_c('./DATA/UKB/PROCESSED/',instance,'/ukb_ALLpanel_pp_hcm_covariates_bp_t2d_smoking_rcmmcov.tsv',collapse=''))
+} else {
+  ukb_pp_hcm_cov2 <- read_tsv(str_c('./DATA/UKB/PROCESSED/',instance,'/ukb_ALLpanel_pp_hcm_covariates_bp_t2d_smoking.tsv',collapse=''))
+}
+
+ukb_pp_hcm_cov2 <- ukb_pp_hcm_cov2 %>%
+  mutate(smoking=factor(smoking, levels=c('Never','Previous','Current')))
+
+ukb_pp_list <- read_tsv('DATA/UKB/PROCESSED/ukb_pp_list_allpanel.tsv') %>%
+  filter(ukb_fieldname_equivalent != 'glipr1')
+
+if (pp_scaling == 'scale'){
+  pp <- ukb_pp_hcm_cov2 %>% select(all_of(ukb_pp_list$ukb_fieldname_equivalent)) %>%
+    scale()
+  
+  ukb_pp_hcm_cov2 <- ukb_pp_hcm_cov2 %>%
+    select(-all_of(ukb_pp_list$ukb_fieldname_equivalent)) %>%
+    bind_cols(pp)
+  rm(pp)
+  
+}else if (pp_scaling == 'ranknorm'){
+  ukb_pp_hcm_cov2 <- ukb_pp_hcm_cov2 %>%
+    mutate(across(all_of(ukb_pp_list$ukb_fieldname_equivalent), ~ replace(., !is.na(.), RNOmni::RankNorm(.[!is.na(.)]))))
+}
+```
+
+```{r}
+#Check the distribution of pp of interest
+pp_of_interest <- c('ntprobnp','angpt2','ltbp2')
+pp_of_interest_names <- c('NTproBNP','ANGPT2','LTBP2')
+
+dist_checker <- function(input_vector, pp_name){
+  print(hist(input_vector, xlab=pp_name, main=str_glue('Histogram of {pp_name}')))
+  print(str_glue('{pp_name} mean = {mean(input_vector,na.rm=T)}'))
+  print(str_glue('{pp_name} SD = {sd(input_vector,na.rm=T)}'))
+}
+
+
+walk2(list(
+  ukb_pp_hcm_cov2$ntprobnp,
+  ukb_pp_hcm_cov2$angpt2,
+  ukb_pp_hcm_cov2$ltbp2), pp_of_interest_names,
+  ~ dist_checker(.x, .y)
+)
+```
+
+```{r}
+#Filter for only HCM cases here
+if (instance %in% c('1_I0','2_5Y','3_TOTAL')) {
+ ukb_pp_hcm_cov2 <- ukb_pp_hcm_cov2 %>%
+  filter(hcm==T)
+} else if (instance == '4_NEGTOTAL'){
+  hf_eid <- read_csv('./DATA/UKB/RAP/Cases/ukb_rap_HF_20240209.csv')
+  colnames(hf_eid) <- 'ID'
+
+  ukb_pp_hcm_cov2 <- ukb_pp_hcm_cov2 %>%
+    mutate(hf = ifelse(eid %in% hf_eid$ID, T,F)) %>%
+    filter(hcm==F, hf==F)
+}
+```
+
+## Import Outcome Data
+
+This looks at the number of events which occur within the 100 HCM cases who have plasma proteomic data.
+
+For the plasma proteomic severity analysis, you will have to perform left truncation of events that happen prior to the attendance of assessment centre at instance 0 (i.e when blood samples taken).
+
+tss refers to 'time since start' which refers to the approach where I use the start age as the baseline and compute the outcome times as years since the baseline so time since start = timescale, as opposed to using age itself as the timescale.
+```{r}
+#' Calculate Left-Truncated Composite Outcome Status, Age/Time, and Filter Prevalent Cases
+#'
+#' Identifies the first composite outcome event occurring strictly after a baseline age,
+#' calculates the corresponding status and age/time-to-event, and **filters out
+#' individuals whose first-ever composite event occurred at or before the baseline age**
+#' (prevalent cases). Optionally calculates time since a specified start age.
+#'
+#' @details
+#' 1.  **Identify True First Event:** Determines the earliest age of any event listed
+#'     in `outcome_cols` for each individual, regardless of the baseline age
+#'     (`true_min_event_age`).
+#' 2.  **Identify First Post-Baseline Event:** Temporarily sets values in `outcome_cols`
+#'     to `NA` if they are less than or equal to the corresponding value in
+#'     `baseline_age_col`. Then finds the minimum remaining event age
+#'     (`min_post_baseline_event_age`).
+#' 3.  **Status Calculation:** Calculates the status (1 if any *post-baseline*
+#'     event occurred, 0 otherwise).
+#' 4.  **Age/Time Calculation:** Determines the composite age/time to the first
+#'     *post-baseline* event or censoring.
+#'     * If `tss = FALSE` (default): This is `min_post_baseline_event_age` if status is 1,
+#'       otherwise the censoring age (`censoring_age_col`).
+#'     * If `tss = TRUE`: This is the time elapsed between `start_age_col` and
+#'       the first *post-baseline* event or censoring time.
+#' 5.  **Left Truncation Filtering:** **Removes rows** where the `true_min_event_age`
+#'     (calculated in step 1) is less than or equal to the `baseline_age_col`. Only
+#'     individuals who were event-free at the time specified by `baseline_age_col`
+#'     are retained in the output.
+#'
+#' @param data A dataframe or tibble.
+#' @param outcome_cols A character vector of column names defining the composite outcome
+#'     (containing event ages or NA).
+#' @param status_col_name The desired name for the new status column (string).
+#' @param age_col_name The desired name for the new composite age/time column (string).
+#' @param baseline_age_col The name of the column containing the baseline age/time for
+#'     left-truncation filtering (string). Individuals with any event in `outcome_cols`
+#'     at or before this age will be removed.
+#' @param censoring_age_col The name of the column containing the censoring age/time
+#'     (string). Defaults to "censoring_age".
+#' @param tss Logical. If `TRUE`, calculates time since `start_age_col`. Defaults to `FALSE`.
+#' @param start_age_col Character string. Required and must be a valid column name
+#'     in `data` only if `tss = TRUE`. Defaults to `NULL`.
+#'
+#' @return A dataframe/tibble **containing only the subset of individuals who were
+#'   event-free at `baseline_age_col`**. This filtered dataframe includes the
+#'   two new composite columns (`status_col_name` and `age_col_name`) reflecting
+#'   events occurring *after* `baseline_age_col`. The `age_col_name` column
+#'   represents absolute age if `tss = FALSE`, or time-since-start if `tss = TRUE`.
+#'   The original `outcome_cols` within the returned dataframe are NOT modified
+#'   (unlike the previous version).
+
+add_composite_outcome_filtered <- function(data,
+                                      outcome_cols,
+                                      status_col_name,
+                                      age_col_name,
+                                      baseline_age_col,
+                                      follow_up_time_col_name = 'follow_up_time',
+                                      censoring_age_col = "censoring_age",
+                                      tss = FALSE, # Use tss consistently
+                                      start_age_col = NULL) {
+
+  # --- Load Namespace ---
+  if (!requireNamespace("dplyr", quietly = TRUE)) {
+    stop("Package 'dplyr' must be installed to use this function.", call. = FALSE)
+  }
+  if (!requireNamespace("matrixStats", quietly = TRUE)) {
+    stop("Package 'matrixStats' must be installed to use this function.", call. = FALSE)
+  }
+
+  # --- Input Checks ---
+  # (Keeping checks mostly the same as original, ensuring column names are checked)
+   if (!is.data.frame(data)) {
+    stop("Input 'data' must be a data frame or tibble.", call. = FALSE)
+  }
+  if (!is.character(outcome_cols) || length(outcome_cols) == 0) {
+    stop("'outcome_cols' must be a non-empty character vector of column names.", call. = FALSE)
+  }
+  if (!is.character(status_col_name) || length(status_col_name) != 1 || !nzchar(status_col_name)) {
+    stop("'status_col_name' must be a single, non-empty string.", call. = FALSE)
+  }
+  if (!is.character(age_col_name) || length(age_col_name) != 1 || !nzchar(age_col_name)) {
+    stop("'age_col_name' must be a single, non-empty string.", call. = FALSE)
+  }
+  if (!is.character(baseline_age_col) || length(baseline_age_col) != 1 || !nzchar(baseline_age_col)) {
+    stop("'baseline_age_col' must be a single, non-empty string.", call. = FALSE)
+  }
+  if (!is.character(censoring_age_col) || length(censoring_age_col) != 1 || !nzchar(censoring_age_col)) {
+    stop("'censoring_age_col' must be a single, non-empty string.", call. = FALSE)
+  }
+  if (!is.logical(tss) || length(tss) != 1) {
+      stop("'tss' must be a single logical value (TRUE or FALSE).", call. = FALSE)
+  }
+  if (tss) {
+      if (is.null(start_age_col)) {
+          stop("If 'tss' is TRUE, 'start_age_col' must be provided.", call. = FALSE)
+      }
+      if (!is.character(start_age_col) || length(start_age_col) != 1 || !nzchar(start_age_col)) {
+          stop("If 'tss' is TRUE, 'start_age_col' must be a single, non-empty string.", call. = FALSE)
+      }
+  }
+
+  required_cols <- c(outcome_cols, censoring_age_col, baseline_age_col)
+  if (tss) {
+      required_cols <- c(required_cols, start_age_col)
+  }
+  missing_cols <- setdiff(required_cols, names(data))
+  if (length(missing_cols) > 0) {
+      stop("The following required columns are missing from 'data': ",
+           paste(missing_cols, collapse = ", "), call. = FALSE)
+  }
+   if (status_col_name %in% names(data)) {
+      warning("Output column '", status_col_name,
+              "' already exists in the data and will be overwritten.", call. = FALSE, immediate. = TRUE)
+  }
+  if (age_col_name %in% names(data)) {
+     warning("Output column '", age_col_name,
+             "' already exists in the data and will be overwritten.", call. = FALSE, immediate. = TRUE)
+  }
+
+  # --- Calculations ---
+
+  # Make a copy to avoid modifying the original input data directly
+  data_mod <- data
+
+  # Step 0: Calculate True Minimum Event Age (Before any modification)
+  true_min_event_age_vector <- {
+      temp_matrix <- as.matrix(data_mod %>% dplyr::select(dplyr::all_of(outcome_cols)))
+      min_vals <- matrixStats::rowMins(temp_matrix, na.rm = TRUE)
+      min_vals[is.infinite(min_vals)] <- NA_real_ # Convert Inf back to NA
+      min_vals
+  }
+  # Add temporarily to the data frame for filtering later
+  data_mod <- data_mod %>% dplyr::mutate(..true_min_event_age.. = true_min_event_age_vector)
+
+  # Step 1: Create Temporarily Modified Outcome Columns (Post-Baseline Only)
+  # We apply the modification logic but store results temporarily, not overwriting originals in data_mod
+  temp_outcome_data <- data_mod %>%
+    dplyr::transmute(
+      dplyr::across(
+        dplyr::all_of(outcome_cols),
+        # Function: if current value (.) is less than OR EQUAL TO baseline age, return NA
+        # Use <= because we want events *after* baseline age.
+        ~ dplyr::if_else(. <= .data[[baseline_age_col]], NA_real_, .),
+        .names = "..temp_{.col}" # Create temporary column names
+      )
+    )
+  temp_outcome_cols <- names(temp_outcome_data) # Get the names of the temp columns
+
+  # Step 2: Calculate Status (based on *post-baseline* events)
+  # Status is 1 if any *temporary post-baseline* outcome column is not NA.
+  data_mod <- data_mod %>%
+      dplyr::bind_cols(temp_outcome_data) %>% # Add temporary columns
+      dplyr::mutate(
+          "{status_col_name}" := as.numeric(dplyr::if_any(dplyr::all_of(temp_outcome_cols), ~!is.na(.)))
+      )
+
+  # Step 3: Calculate Minimum Post-Baseline Event Age
+  min_post_baseline_event_age_vector <- {
+      temp_matrix <- as.matrix(data_mod %>% dplyr::select(dplyr::all_of(temp_outcome_cols)))
+      min_vals <- matrixStats::rowMins(temp_matrix, na.rm = TRUE)
+      min_vals[is.infinite(min_vals)] <- NA_real_
+      min_vals
+  }
+
+ # Step 4: Determine the relevant 'end age' (first post-baseline event or censoring age)
+  end_age_vector <- dplyr::if_else( data_mod[[status_col_name]] == 1,
+                                      min_post_baseline_event_age_vector,
+                                      data_mod[[censoring_age_col]] )
+
+  # Step 5: Calculate Final Composite Age/Time based on 'tss' flag
+  if (tss) {
+      start_age_vector <- data_mod[[start_age_col]]
+      final_time_vector <- end_age_vector - start_age_vector
+      # Ensure time is not negative if censoring/event happens before start_age_col (shouldn't happen with proper data)
+      final_time_vector <- pmax(0, final_time_vector, na.rm = TRUE)
+      data_mod <- data_mod %>%
+          dplyr::mutate("{age_col_name}" := final_time_vector)
+  } else {
+      data_mod <- data_mod %>%
+          dplyr::mutate("{age_col_name}" := end_age_vector)
+  }
+
+  # Step 6: Calculate Follow-up Time from baseline_age_col
+  # This is the duration from baseline to the event/censoring point used for post-baseline analysis
+  follow_up_duration_vector <- end_age_vector - data_mod[[baseline_age_col]]
+  # Ensure follow-up is not negative (should be handled by pmax in step 4 for final_composite_age_after_baseline)
+  follow_up_duration_vector <- pmax(0, follow_up_duration_vector, na.rm = TRUE) # na.rm should be FALSE if NAs are meaningful
+
+  data_mod <- data_mod %>%
+    dplyr::mutate("{follow_up_time_col_name}" := follow_up_duration_vector)
+  
+  # Step 7: Perform Left Truncation Filtering
+  # Keep rows where there was no event ever OR the first true event occurred strictly AFTER baseline age
+  data_filtered <- data_mod %>%
+      dplyr::filter(is.na(..true_min_event_age..) | ..true_min_event_age.. > .data[[baseline_age_col]])
+
+  # --- Clean up temporary columns and Return ---
+  data_final <- data_filtered %>%
+      dplyr::select(-dplyr::all_of(c("..true_min_event_age..", temp_outcome_cols))) # Remove temporary cols
+
+
+  # Check if any rows remain after filtering
+  if (nrow(data_final) == 0) {
+      warning("All rows were removed by left-truncation filtering based on '", baseline_age_col, "'. Returning an empty data frame.", call. = FALSE)
+  } else if (nrow(data_final) < nrow(data)) {
+       message(nrow(data) - nrow(data_final), " rows removed due to events occurring at or before '", baseline_age_col, "'.")
+  }
+  
+
+
+  return(data_final)
+}
+```
+
+Using age as timescale but using the blood_sample_age as the entry_age and the end_age = censoring_age or min_event_age.
+
+```{r}
+#Import in ukb_pp_hcm_outcome
+ukb_pp_hcm_outcome <- data.table::fread('../../HCM_Severity/DATASETS/UKB/RAP/Outcomes/Processed/allukb_outcome_ages.tsv')
+data.table::setDF(ukb_pp_hcm_outcome) # Convert back to data frame if you prefer dplyr downstream
+
+ukb_pp_hcm_outcome <- ukb_pp_hcm_outcome%>%
+  filter(ID %in% ukb_pp_hcm_cov2$eid) 
+
+#Add the blood sample collection dates
+ukb_blood_sample_collection_dates <- read_tsv('DATA/UKB/RAP/Cases/2024_02_09_allUKB_BloodCollection_Time.tsv')
+colnames(ukb_blood_sample_collection_dates) <- c('ID','blood_collectdate')
+ukb_pp_hcm_outcome <- left_join(ukb_pp_hcm_outcome,ukb_blood_sample_collection_dates)
+
+ukb_pp_hcm_outcome<- ukb_pp_hcm_outcome%>%
+  mutate(blood_collectdate=as_date(blood_collectdate), dob_approx=as_date(dob_approx)) %>%
+  mutate(blood_sample_age = as.numeric(blood_collectdate-dob_approx)/363.25)
+
+# Define Overall Composite Columns
+overall_outcome_cols <- names(ukb_pp_hcm_outcome)[which(names(ukb_pp_hcm_outcome) == "arrest_age_i46"):which(names(ukb_pp_hcm_outcome) == "HeartTransplant_mergeage")]
+
+ukb_pp_hcm_outcome_tbs <- vector('list', 3)
+
+ukb_pp_hcm_outcome_tbs[[3]] <- add_composite_outcome_filtered(
+   data = ukb_pp_hcm_outcome,
+   outcome_cols = overall_outcome_cols,
+   status_col_name = "overallcomp_status",
+   age_col_name = "overallcomp_age",
+   baseline_age_col = "age_attend_i0",
+   tss=F, start_age_col = 'blood_sample_age'
+)
+
+```
+
+
+```{r}
+# Define Ventricular Arrhythmia Composite Columns
+va_outcome_cols <- c('arrest_age_i46', 'scd_age_i46.1', 'ICDImplant_mergeage')
+
+ukb_pp_hcm_outcome_tbs[[1]] <- add_composite_outcome_filtered(
+   data = ukb_pp_hcm_outcome,
+   outcome_cols = va_outcome_cols,
+   status_col_name = "vacomp_status",
+   age_col_name = "vacomp_age",
+   baseline_age_col = "age_attend_i0",
+   tss=F, start_age_col = 'blood_sample_age'
+)
+
+# Define Heart Failure Composite Columns
+hf_outcome_cols <- c('hf_age_i50', 'HeartTransplant_mergeage')
+
+ukb_pp_hcm_outcome_tbs[[2]] <- add_composite_outcome_filtered(
+   data = ukb_pp_hcm_outcome,
+   outcome_cols = hf_outcome_cols,
+   status_col_name = "hfcomp_status",
+   age_col_name = "hfcomp_age",
+   baseline_age_col = "age_attend_i0",
+   tss=F, start_age_col = 'blood_sample_age'
+)
+
+# print(ukb_pp_hcm_outcome)
+
+ukb_pp_hcm_outcome_tbs <- map(ukb_pp_hcm_outcome_tbs, ~left_join(ukb_pp_hcm_cov2,., by=c('eid'='ID'))%>%
+  dplyr::rename('ID'='eid'))
+names(ukb_pp_hcm_outcome_tbs) <- c('VACOMP','HFCOMP','OVERALLCOMP')
+```
+```{r}
+#Report the median and IQR for follow-up times
+
+median_iqr_extractor <- function(input_tb){
+  x <- input_tb$follow_up_time
+  x <- x[!is.na(x)] #Remove NA values
+  output <- str_c(signif(median(x),3), signif(quantile(x,0.25),3), signif(quantile(x, 0.75),3), sep = ' ')
+  return(output)
+}
+
+summary_followuptimes <- map(ukb_pp_hcm_outcome_tbs, ~median_iqr_extractor(.)) 
+names(summary_followuptimes) <- c('VACOMP','HFCOMP','OVERALLCOMP')
+
+```
+
+```{r}
+#Report a summary table of the number of event outcomes for each of the composite outcomes
+
+#' Summarize First Post-Baseline Event Components
+#'
+#' Takes the output from `add_composite_outcome_filtered` and summarizes how many
+#' times each specified outcome component was the *first* event contributing to
+#' the composite outcome status.
+#'
+#' @details
+#' This function filters for individuals who experienced a composite event (where
+#' `status_col_name` is 1). It then determines the actual age of this first
+#' post-baseline composite event. Finally, for each outcome component listed in
+#' `outcome_cols`, it counts how many times that component's event age matches
+#' the age of the first post-baseline composite event.
+#'
+#' If `tss = TRUE`, the function reconstructs the absolute age of the composite
+#' event using `age_col_name` (which is time-since-start) and `start_age_col`
+#' before comparing with the ages in `outcome_cols`.
+#'
+#' @param data A dataframe or tibble, typically the output from
+#'   `add_composite_outcome_filtered`.
+#' @param outcome_cols A character vector of the original outcome column names
+#'   (e.g., "arrest_age", "scd_age") that are present in `data`.
+#' @param status_col_name The name of the status column in `data` (string,
+#'   created by `add_composite_outcome_filtered`).
+#' @param age_col_name The name of the composite age/time column in `data` (string,
+#'   created by `add_composite_outcome_filtered`).
+#' @param tss Logical. If `TRUE`, `age_col_name` is treated as time-since-start,
+#'   and `start_age_col` is used to calculate the absolute event age.
+#'   Defaults to `FALSE`.
+#' @param start_age_col Character string. Required and must be a valid column name
+#'   in `data` if `tss = TRUE`. This column contains the start age for
+#'   time-since-start calculations. Defaults to `NULL`.
+#'
+#' @return A tibble with two columns:
+#'   \item{OutcomeComponent}{The names of the outcome components from `outcome_cols`.}
+#'   \item{NumberOfFirstEvents}{The number of times each component was identified
+#'         as the first post-baseline event.}
+
+summarize_event_components <- function(data,
+                                     outcome_cols,
+                                     status_col_name,
+                                     age_col_name,
+                                     tss = FALSE,
+                                     start_age_col = NULL) {
+
+  # --- Load Namespace / Input Checks for Packages ---
+  if (!requireNamespace("dplyr", quietly = TRUE)) {
+    stop("Package 'dplyr' must be installed.", call. = FALSE)
+  }
+  if (!requireNamespace("tibble", quietly = TRUE)) {
+    stop("Package 'tibble' must be installed.", call. = FALSE)
+  }
+  if (!requireNamespace("purrr", quietly = TRUE)) {
+    stop("Package 'purrr' must be installed.", call. = FALSE)
+  }
+
+  # --- Basic Input Checks ---
+  if (!is.data.frame(data)) {
+    stop("Input 'data' must be a data frame or tibble.", call. = FALSE)
+  }
+  if (!is.character(outcome_cols) || length(outcome_cols) == 0) {
+    stop("'outcome_cols' must be a non-empty character vector.", call. = FALSE)
+  }
+  if (!all(sapply(outcome_cols, function(col) col %in% names(data)))) {
+    missing_outcome_cols <- outcome_cols[!outcome_cols %in% names(data)]
+    stop("The following 'outcome_cols' are missing from data: ",
+         paste(missing_outcome_cols, collapse = ", "), call. = FALSE)
+  }
+  if (!is.character(status_col_name) || length(status_col_name) != 1 || !nzchar(status_col_name) || !status_col_name %in% names(data)) {
+    stop("'status_col_name' must be a single string representing an existing column in data.", call. = FALSE)
+  }
+  if (!is.character(age_col_name) || length(age_col_name) != 1 || !nzchar(age_col_name) || !age_col_name %in% names(data)) {
+    stop("'age_col_name' must be a single string representing an existing column in data.", call. = FALSE)
+  }
+  if (!is.logical(tss) || length(tss) != 1) {
+    stop("'tss' must be a single logical value (TRUE or FALSE).", call. = FALSE)
+  }
+
+  if (tss) {
+    if (is.null(start_age_col)) {
+      stop("If 'tss' is TRUE, 'start_age_col' must be provided.", call. = FALSE)
+    }
+    if (!is.character(start_age_col) || length(start_age_col) != 1 || !nzchar(start_age_col) || !start_age_col %in% names(data)) {
+      stop("If 'tss' is TRUE, 'start_age_col' must be a single string representing an existing column in data.", call. = FALSE)
+    }
+  }
+
+  # --- Main Logic ---
+
+  # Filter for individuals who experienced a composite event
+  event_data <- data %>%
+    dplyr::filter(.data[[status_col_name]] == 1)
+
+  if (nrow(event_data) == 0) {
+    # Return a tibble with 0 counts if no events occurred
+    summary_table <- tibble::tibble(
+      OutcomeComponent = outcome_cols,
+      NumberOfFirstEvents = 0L # Integer type
+    )
+    message("No individuals with status == 1 found. Returning zero counts.")
+    return(summary_table)
+  }
+
+  # Determine the actual absolute age of the composite event
+  if (tss) {
+    # Check for NAs in start_age_col or age_col_name for event_data, which could lead to NA actual_event_age
+     if(any(is.na(event_data[[start_age_col]]))) {
+        warning("NA values found in '", start_age_col, "' for individuals with an event. This may result in NA actual event ages and affect counts.", call. = FALSE, immediate. = TRUE)
+    }
+    if(any(is.na(event_data[[age_col_name]]))) {
+        warning("NA values found in '", age_col_name, "' for individuals with an event. This may result in NA actual event ages and affect counts.", call. = FALSE, immediate. = TRUE)
+    }
+    event_data <- event_data %>%
+      dplyr::mutate(..actual_event_age.. = .data[[age_col_name]] + .data[[start_age_col]])
+  } else {
+    if(any(is.na(event_data[[age_col_name]]))) {
+        warning("NA values found in '", age_col_name, "' for individuals with an event. This may result in NA actual event ages and affect counts.", call. = FALSE, immediate. = TRUE)
+    }
+    event_data <- event_data %>%
+      dplyr::mutate(..actual_event_age.. = .data[[age_col_name]])
+  }
+  
+  # Filter out rows where ..actual_event_age.. became NA (e.g. due to NA in start_age_col)
+  # as these cannot be meaningfully compared.
+  n_rows_before_na_filter <- nrow(event_data)
+  event_data <- event_data %>% dplyr::filter(!is.na(..actual_event_age..))
+  if (nrow(event_data) < n_rows_before_na_filter) {
+      warning(n_rows_before_na_filter - nrow(event_data), 
+              " rows removed from event data due to NA '..actual_event_age..'.", call. = FALSE, immediate. = TRUE)
+      if (nrow(event_data) == 0) {
+        summary_table <- tibble::tibble(
+            OutcomeComponent = outcome_cols,
+            NumberOfFirstEvents = 0L 
+        )
+        message("No valid actual event ages after handling potential NAs. Returning zero counts.")
+        return(summary_table)
+      }
+  }
+
+
+  # Calculate counts for each outcome component
+  counts <- purrr::map_int(outcome_cols, function(component_col) {
+    # For each component, count rows where component_age == ..actual_event_age..
+    # Ensure component_age is not NA.
+    # dplyr::near is used for robust comparison of numeric (potentially float) ages.
+    sum(
+      !is.na(event_data[[component_col]]) &
+      dplyr::near(event_data[[component_col]], event_data$..actual_event_age..),
+      na.rm = TRUE # Handles cases where near() might return NA if one of its inputs is NA
+                 # (though ..actual_event_age.. should be filtered for NA by now)
+    )
+  })
+
+  summary_table <- tibble::tibble(
+    OutcomeComponent = outcome_cols,
+    NumberOfFirstEvents = counts
+  ) %>%
+    arrange(desc(NumberOfFirstEvents))
+
+  return(summary_table)
+}
+```
+
+```{r}
+ukb_pp_hcm_outcome_summs <- vector('list', 3)
+
+ukb_pp_hcm_outcome_summs[[3]] <- summarize_event_components(
+  data=ukb_pp_hcm_outcome_tbs[[3]],
+  outcome_cols = overall_outcome_cols,
+  status_col_name = "overallcomp_status",
+  age_col_name = "overallcomp_age"
+)
+
+ukb_pp_hcm_outcome_summs[[1]] <- summarize_event_components(
+  data=ukb_pp_hcm_outcome_tbs[[1]],
+  outcome_cols = va_outcome_cols,
+  status_col_name = "vacomp_status",
+  age_col_name = "vacomp_age"
+)
+
+ukb_pp_hcm_outcome_summs[[2]] <- summarize_event_components(
+  data=ukb_pp_hcm_outcome_tbs[[2]],
+  outcome_cols = hf_outcome_cols,
+  status_col_name = "hfcomp_status",
+  age_col_name = "hfcomp_age"
+)
+
+names(ukb_pp_hcm_outcome_summs) <- c('VACOMP','HFCOMP','OVERALLCOMP')
+
+map(ukb_pp_hcm_outcome_summs, ~knitr::kable(.))
+```
+
+
+## Continuous Variable Binning
+
+This enables you to select continuous variables to bin into groups/categorical variables for plotting of Kaplan Meier analyses.
+
+```{r}
+contvar_binner <- function(input_tb, variable, threshold, signif=F){ #Assumes split into two groups
+  newcolname <- str_c(variable,'_categorical')
+  
+  output <- mutate(input_tb,
+                   temp=ifelse(eval(parse(text=variable)) >= threshold, str_c('>= ', threshold), str_c('< ', threshold)))
+  colnames(output)[ncol(output)] <- newcolname
+  
+  return(output)
+}
+
+for (pp in pp_of_interest){
+  threshold <- signif(quantile(ukb_pp_hcm_cov2[pp],probs=0.75,na.rm=T),3) #Use the threshold from all 100 HCM cases instead of the per-outcome datasets which have left-truncation
+  ukb_pp_hcm_outcome_tbs <- map(ukb_pp_hcm_outcome_tbs, ~contvar_binner(., pp, threshold)) 
+}
+rm(pp)
+```
+
+
+## Kaplan Meier Survival Curves
+
+This conducts some univariate analysis on categorical variables by plotting Kaplan-Meier survival curves for each category and performing log-rank test (non-parametric but also univariate).
+
+The p-values and confidence intervals for difference between the groups on the plots arises from the regular log-rank test.
+
+Such variables include
+
+- Sex
+
+I also change the y-axis to output cumulative incidence of events as well as cumulative hazard (number of events that would be expected for each individual by time t if the event were a repeatable process).
+
+
+```{r}
+km_survival_curv_plotter <- function(input_tb, categorical_var, status, outcome_var, plot_output_folder){
+  # categorical_var, status, and outcome_var are now expected as strings
+  print(paste('Plotting Kaplan Meier survival curves for', categorical_var))
+  
+  plot_types <- c('pct', 'event', 'cumhaz')
+  
+  # Construct the survival formula as a formula object
+  surv_formula <- as.formula(paste0("Surv(", outcome_var, ", ", status, ") ~ ", categorical_var))
+  
+  for (type in plot_types){
+    # Fit the survival model using the constructed formula
+    surv_fit <- survfit(surv_formula, data = input_tb)
+    
+    # Update the call in the fitted object so that the data and formula are directly accessible.
+    # This is good practice for ggsurvplot if data isn't explicitly passed to it later.
+    surv_fit$call$data <- quote(input_tb) # Use quote() for unevaluated expression
+    surv_fit$call$formula <- surv_formula
+    
+    # Generate the survival plot using ggsurvplot
+    # The 'plot' object here is a ggsurvplot object, which is a list of ggplots
+    plot_obj <- ggsurvplot(
+      fit = surv_fit,
+      data = input_tb, # Explicitly passing data is good practice
+      fun = type,
+      pval = TRUE,
+      conf.int = TRUE,
+      risk.table = 'abs_pct', # Shows absolute number and percentage
+      risk.table.col = 'strata',
+      linetype = 'strata',
+      surv.median.line = 'hv',
+      break.time.by = 10, # Assuming 'Age' (outcome_var) is in years
+      xlab = 'Age',
+      ncensor.plot = TRUE, # Show number of censored subjects plot
+      ggtheme = theme_classic(base_size=14) # Added a theme for better aesthetics, optional
+    )
+    
+    # Print plot to R console/plotting window (optional during function execution)
+    # print(plot_obj) 
+    
+    # Create output folder if it does not exist
+    if (!dir.exists(plot_output_folder)){
+      dir.create(plot_output_folder, recursive = TRUE)
+      print(paste("Created output folder:", plot_output_folder))
+    }
+    
+    # --- Save plot to a PDF file ---
+    pdf_filename <- file.path(plot_output_folder, paste0(categorical_var, '_kaplan_', type, '.pdf'))
+    pdf(pdf_filename, width = 12, height = 9)
+    # When printing a ggsurvplot object (which is a list of plots),
+    # the print method for ggsurvplot arranges and draws them.
+    print(plot_obj, newpage = FALSE) 
+    dev.off()
+    print(paste("Saved PDF:", pdf_filename))
+    
+    # --- Save plot to a PNG file with DPI 600 ---
+    png_filename <- file.path(plot_output_folder, paste0(categorical_var, '_kaplan_', type, '.png'))
+    # For png, res is used for DPI. width and height are in inches by default.
+    png(png_filename, width = 12, height = 9, units = "in", res = 600)
+    print(plot_obj, newpage = FALSE) # Use the same print method as for PDF
+    dev.off()
+    print(paste("Saved PNG:", png_filename))
+  }
+  print(paste('Finished plotting for', categorical_var))
+}
+
+```
+
+
+```{r kaplan_meier, fig.width=9, fig.height=10, message=F, warning=F}
+outcomes_of_interest <- c('1_VA','2_HF','3_OV')
+
+if(isTRUE(rcmm_cov)){
+  plotpaths <- str_c('./OUTPUT/UKB/PLOTS/4_SURVIVAL/1_UNIVARIATE_KM/',instance,'/', outcomes_of_interest,'/rcmm_cov/') #Need to run separate results because 103 cases -> 100 cases when using expanded covariates
+} else{
+  plotpaths <- str_c('./OUTPUT/UKB/PLOTS/4_SURVIVAL/1_UNIVARIATE_KM/',instance,'/', outcomes_of_interest,'/') 
+}
+
+catvars_of_interest <- str_c(pp_of_interest, '_categorical')
+
+
+#Run for UKB - Overall Composite
+walk(catvars_of_interest, ~km_survival_curv_plotter(ukb_pp_hcm_outcome_tbs[[3]], ., 'overallcomp_status','overallcomp_age',plotpaths[3])) #Using top 25% vs. bottom 75%
+
+#Run for UKB - HF Composite
+walk(catvars_of_interest, ~km_survival_curv_plotter(ukb_pp_hcm_outcome_tbs[[2]], ., 'hfcomp_status','hfcomp_age',plotpaths[2])) 
+
+#Run for UKB - VA Composite
+walk(catvars_of_interest, ~km_survival_curv_plotter(ukb_pp_hcm_outcome_tbs[[1]], ., 'vacomp_status','vacomp_age',plotpaths[1])) 
+```
+
+# Cox Regression
+
+This is used to model the survival function (via the hazard function) for event composite Y with regards to covariates + plasma protein X (i.e marginal models).
+
+## Univariate Cox Regression
+
+This applies Cox regression to each of the predictors individually.
+
+To interpret the summary results:
+
+- z refers to Wald test statistic (coef/se(coef)) to evaluate if the beta i.e coefficient is statistically significantly different from 0.
+- p-value refers to Wald-test derived p-value
+
+- Coefficient value and exp(coef) i.e hazard ratio reflects the change in hazard with each unit increase in predictor.
+  * Hazard ratio can be interpreted as e.g hazard ratio of 0.59 means hazard reduced by 41% while hazard ratio of 1.41 means hazard increased by 41%.
+- Confidence intervals of hazard ratios also given.
+
+- Concordance i.e C-statistic is ~ AUC in that values of c near 0.5 indicate that the predictions are no better than a coin flip in determining which patient will live longer. Values near 1 indicate that the risk scores are good at determining which of two patients will have the disease first.
+  * Crudely put, concordance shows your ability to predict who of a pair will die sooner, but not necessarily how much sooner or what proportion of the variance of event times is explained by the model.
+
+- Global statistical significance of model (i.e for overall model including all predictors)
+  * LRT preferred at smaller sample sizes but all 3x tests are asymptotically equivalent at large N
+
+```{r univariate_cox, message=F, warning=F}
+# coxph_univariate <- function(input_tb, predictor_var,status, outcome_var){
+#   
+#     params <- list(fun.time = substitute(eval(parse(text=outcome_var))),
+#     fun.event = substitute(eval(parse(text=status))),
+#     grouping = substitute(eval(parse(text=predictor_var))), 
+#     data = substitute(input_tb))
+#     
+#     coxph <- substitute(coxph(Surv(fun.time,fun.event)~grouping, data), params)
+#     coxph <- eval.parent(coxph)
+#     
+#     print(str_c('Univariate Cox Regression performed on ', predictor_var, ' variable on ', outcome_var))
+#     
+#     x <- summary(coxph)
+#     #print(x)
+#     
+#     p.value<-signif(x$wald["pvalue"], digits=3)
+#     wald.test<-signif(x$wald["test"], digits=3)
+#     beta<-signif(x$coef[1], digits=3);#coeficient beta
+#     se_beta <- signif(x$coef[3], digits=3)
+#     HR <-signif(x$coef[2], digits=3);#exp(beta)
+#     HR.confint.lower <- signif(x$conf.int[,"lower .95"], 3)
+#     HR.confint.upper <- signif(x$conf.int[,"upper .95"],3)
+#     res<-c(beta, se_beta, HR, HR.confint.lower, HR.confint.upper, wald.test, p.value)
+#     names(res)<-c("beta", 'se_beta', "HR", "Lower_95CI_HR","Upper_95CI_HR", "wald.test", 
+#                   "p.value")
+#     
+#     return(res)
+# }
+
+
+```
+
+
+```{r univariate_cox_ukb, message=F, warning=F}
+#For UKB
+if(isTRUE(rcmm_cov)){
+  covariates <- c('sex','bmi','pc1','pc2','pc3','pc4','pc5','dbp','smoking','t2d', 'Townsend', 'eGFR', 'ldl')
+}else {
+  covariates <- c('sex','bmi','pc1','pc2','pc3','pc4','pc5','dbp','smoking','t2d')
+}
+
+pp <- c('ntprobnp', 'angpt2','ltbp2') 
+statuses <- c('vacomp_status','hfcomp_status','overallcomp_status')
+surv_ages <- c('vacomp_age','hfcomp_age','overallcomp_age')
+
+# univariate_cox_results <- c(
+#   map(pp, ~coxph_univariate(ukb_tb,.,statuses[1],surv_ages[1])),
+#   map(pp, ~coxph_univariate(ukb_tb,.,statuses[2],surv_ages[2])),
+#   map(pp, ~coxph_univariate(ukb_tb,.,statuses[3],surv_ages[3]))
+# )
+# 
+# names(univariate_cox_results) <- (expand_grid(pp,surv_ages) %>% mutate(surv_ages = factor(surv_ages, levels=c('vacomp_age','hfcomp_age','overallcomp_age'))) %>% arrange(surv_ages) %>% mutate(name = str_c(pp, surv_ages, sep='_x_')))$name
+```
+
+I also plot the results all together on a single plot of -log10(pvalue) vs. hazard ratio.
+
+```{r univariate_plot, fig.width=9, fig.height=6}
+# univariate_coxph_plotter <- function(univariate_results, plot_output_path, output_name, outcome_levels=c('VA','HF','OVERALL'), FDR=5){
+#   
+#   univariate_tb <- enframe(univariate_results)%>%
+#     unnest(value) %>%
+#     mutate(metric=rep(c("beta", 'se_beta', "HR", "Lower_95CI_HR","Upper_95CI_HR", "wald.test", 
+#                     "p.value"),length(univariate_results))) %>%
+#     pivot_wider(names_from=metric, values_from=value) %>%
+#     dplyr::rename(var=name) %>%
+#     mutate(label=var) %>%
+#     #mutate(label=predictors_xlabel_tb$Label[match(var, predictors_xlabel_tb$Variable)])
+#     arrange(label) %>%
+#     mutate(predictor=str_to_upper(str_match(label,'(.+)_x_')[,2])) %>%
+#     mutate(outcome = factor(
+#       str_to_upper(str_match(label,'_x_(.+)comp_age')[,2]),levels=outcome_levels, ordered=T
+#     ))
+#   
+#   if (!is.numeric(FDR)){ #Apply Bonferroni
+#     pval_threshold = 0.05/length(univariate_results)
+#     mtc <- 'Bonferroni'
+#   } else{
+#     univariate_tb <- mutate(univariate_tb, p.value=p.adjust(p.value, method='BH'))
+#     pval_threshold <- FDR/100
+#     mtc <- str_c('FDR ',FDR, '%',sep='')
+#   }
+# 
+#   univariate_plot <- ggplot(univariate_tb, aes(HR,-log10(p.value)))+
+#     geom_vline(xintercept=1, linetype='dashed',alpha=0.5)+
+#     geom_hline(yintercept=-log10(pval_threshold), linetype='dashed', alpha=0.5)+
+#     geom_point(aes(col=predictor, shape=outcome),alpha=0.75)+
+#     geom_errorbar(aes(xmin=Lower_95CI_HR, xmax=Upper_95CI_HR,col=predictor, shape=outcome),alpha=0.75)+
+#     geom_text_repel(aes(label=HR))+
+#     scale_colour_brewer(name='Predictor',palette='Dark2')+
+#     scale_shape_discrete(name='Outcome')+
+#     xlab('Hazard Ratio')+
+#     ylab(ifelse(mtc=='Bonferroni','-log10 (Wald-test p value)', '-log10 (Adjusted Wald-test p value)'))+
+#     scale_x_continuous(n.breaks=10)+
+#     labs(title=str_wrap(str_c('Univariate Cox Regression analysis for ', length(univariate_results), ' tests')),caption=str_c(mtc, ' p-value Threshold Indicated; Error Bars = 95% CI'))+
+#     theme(legend.position="bottom")+
+#      guides(col=guide_legend(nrow=1, byrow=TRUE)) 
+#   
+#   print(univariate_plot)
+#   ggsave(str_c(plot_output_path, 'cox_univariate_', output_name,'.png'), dpi=600, width=9, height=6)
+#   
+#   return(univariate_tb)
+# }
+```
+
+
+```{r univariate_plot, fig.width=9, fig.height=6}
+# univariate_coxph_plotter(univariate_cox_results, '../OUTPUT/UKB/PLOTS/4_SURVIVAL/2_COXPH/', 'ntprobnp_hrc_alloutcomes_fdr5')
+# univariate_coxph_plotter(univariate_cox_results, '../OUTPUT/UKB/PLOTS/4_SURVIVAL/2_COXPH/', 'ntprobnp_hrc_alloutcomes_bonferroni', FDR=F)
+```
+
+
+## Multivariable Cox Regression
+
+Here I perform multivariable Cox regression using covariates and with each of the plasma proteins of interest modelled marginally.
+
+```{r multivariable_cox, message=F, warning=F}
+multivariable_cox <- function(input_tb, marginal_predictor, covariates, status, outcome_var, baseline_age='age_attend_i0', outcome_levels=c('VA','HF','OVERALL'), return_predictor_results_only=T, return_model=F){ #Return only the coefficient and p-values for the marginal_predictor
+  
+  x <- str_c(c(covariates,marginal_predictor), collapse='+')
+  y <- str_c('Surv(',baseline_age, ',', outcome_var,',',status,')')
+  formula <- as.formula(paste(y,'~',x))
+  
+  multivariable_cox <- coxph(formula, data=input_tb)
+  print(summary(multivariable_cox))
+  
+  x<- summary(multivariable_cox)
+  
+  if(isTRUE(return_model)){
+    return(multivariable_cox)
+  }
+  
+  if(isFALSE(return_predictor_results_only)){ 
+  
+    p.value<-signif(x$coef[1:nrow(x$coef),5], digits=3)
+    beta<-signif(x$coef[1:nrow(x$coef),1], digits=3);#coeficient beta
+    HR <-signif(x$coef[1:nrow(x$coef),2], digits=3);#exp(beta) = hazard ratio
+    HR.confint.lower <- signif(x$conf.int[,"lower .95"], 3)
+    HR.confint.upper <- signif(x$conf.int[,"upper .95"],3)
+    se_beta <- signif(x$coef[1:nrow(x$coef),3], digits=3)
+    vars <- rownames(x$coef)
+  } else{ #This only works if single marginal predictor
+    
+    p.value<-signif(x$coef[nrow(x$coef),5], digits=3)
+    beta<-signif(x$coef[nrow(x$coef),1], digits=3);#coeficient beta
+    HR <-signif(x$coef[nrow(x$coef),2], digits=3);#exp(beta) = hazard ratio
+    HR.confint.lower <- signif(x$conf.int[,"lower .95"][nrow(x$coef)], 3)
+    HR.confint.upper <- signif(x$conf.int[,"upper .95"][nrow(x$coef)],3)
+    se_beta <- signif(x$coef[nrow(x$coef),3], digits=3)
+    vars <- rownames(x$coef)[nrow(x$coef)]
+
+  }
+  
+  res<-bind_cols(vars,beta, se_beta, HR, HR.confint.lower, HR.confint.upper, p.value) %>%
+    mutate(predictor=str_to_upper(vars)) %>%
+    mutate(outcome = factor(
+      str_to_upper(str_match(outcome_var,'(.+)comp_age')[,2]),levels=outcome_levels, ordered=T
+    ))
+  
+  names(res)<-c('var',"beta",'se_beta', "HR", "Lower_95CI_HR","Upper_95CI_HR", 
+            "p.value", 'predictor','outcome')
+  
+  return(res)
+}
+```
+
+
+```{r multivariable_cox, message=F, warning=F}
+#Run marginal Cox regression models for each plasma protein with each outcome of interest
+multivariable_cox_results <- c(
+  map(pp, ~multivariable_cox(ukb_pp_hcm_outcome_tbs[[1]],.,covariates,statuses[1],surv_ages[1])),
+  map(pp, ~multivariable_cox(ukb_pp_hcm_outcome_tbs[[2]],.,covariates,statuses[2],surv_ages[2])),
+  map(pp, ~multivariable_cox(ukb_pp_hcm_outcome_tbs[[3]],.,covariates,statuses[3],surv_ages[3]))
+) %>%
+  bind_rows() %>%
+  filter(!is.na(p.value))
+
+#Actually output the multivariable Cox model objects themselves
+multivariable_cox_models <- c(
+  map(pp, ~multivariable_cox(ukb_pp_hcm_outcome_tbs[[1]],.,covariates,statuses[1],surv_ages[1], return_model=T)),
+  map(pp, ~multivariable_cox(ukb_pp_hcm_outcome_tbs[[2]],.,covariates,statuses[2],surv_ages[2], return_model=T)),
+  map(pp, ~multivariable_cox(ukb_pp_hcm_outcome_tbs[[3]],.,covariates,statuses[3],surv_ages[3], return_model=T))
+)
+names(multivariable_cox_models) <-(expand_grid(pp,surv_ages) %>% mutate(surv_ages = factor(surv_ages, levels=c('vacomp_age','hfcomp_age','overallcomp_age'))) %>% arrange(surv_ages) %>% mutate(name = str_c(pp, surv_ages, sep='_x_')))$name
+```
+
+#### multivariable Summary Plotting
+
+Now plot a summary plot of the results for each predictor.
+
+```{r multivariable_cox_plotter, fig.width=9, fig.height=6, message=F,warning=F}
+
+multivariable_coxph_plotter <- function(multivariable_results, plot_output_path, output_name, selected_vars = c('ntprobnp','angpt2','ltbp2'),FDR=5, xlim=c(0,10), ylim=c(0,6), pp_scaling =F, labeltext_size=5, save_width=9, save_height=6){
+  
+  if (!is.numeric(FDR)){ #Apply Bonferroni
+    pval_threshold = 0.05/nrow(multivariable_results)
+    mtc <- 'Bonferroni'
+  } else{
+    multivariable_results <- mutate(multivariable_results, p.value=p.adjust(p.value, method='BH'))
+    pval_threshold <- FDR/100
+    mtc <- str_c('FDR ',FDR, '%',sep='')
+  }
+  
+  multivariable_results <- multivariable_results %>%
+    filter(var %in% selected_vars) %>%
+    mutate(Label = ifelse(p.value <= pval_threshold, str_c(predictor, ' x ', outcome), ''))
+
+  multivariable_plot <- ggplot(multivariable_results, aes(HR,-log10(p.value)))+
+    geom_hline(yintercept=-log10(pval_threshold), linetype='dashed', alpha=0.5)+
+    geom_point(aes(col=predictor, shape=outcome),alpha=0.75, size=3)+
+    geom_errorbarh(aes(xmin=Lower_95CI_HR, xmax=Upper_95CI_HR,col=predictor, shape=outcome),alpha=0.75, height=0.2)+
+    geom_vline(xintercept=1, linetype='dashed',alpha=0.5)+
+    geom_text_repel(aes(col=predictor,label=Label),size=labeltext_size,force=5)+
+    scale_colour_brewer(name='Predictor',palette='Set1')+
+    scale_shape_discrete(name='Outcome')+
+    xlab(ifelse(pp_scaling == F, 'Hazard Ratio', 'Hazard Ratio per SD'))+
+    ylab(ifelse(mtc=='Bonferroni','-log10 (Wald-test p value)', '-log10 (Adjusted Wald-test p value)'))+
+    # scale_x_continuous(n.breaks=10, limits=xlim, expand = expansion(0,0))+
+    # scale_y_continuous(limits=ylim, expand = expansion(0,0))+
+    labs(title=str_wrap(str_c('multivariable Cox Regression analysis for ', nrow(multivariable_results), ' tests')),caption=str_c(mtc, ' p-value Threshold Indicated; Error Bars = 95% CI'))+
+    theme(legend.position="right")
+  # +   guides(col=guide_legend(nrow=1, byrow=TRUE)) 
+  
+  print(multivariable_plot)
+  
+    if (isFALSE(dir.exists(plot_output_path))){
+      dir.create(plot_output_folder, recursive=T)
+    }
+  
+  ggsave(str_c(plot_output_path, 'cox_multivariable_', output_name,'.png'), dpi=600, width=save_width, height=save_height)
+  
+  return(multivariable_results)
+}
+
+if(isTRUE(rcmm_cov)){
+  path <- str_c('./OUTPUT/UKB/PLOTS/4_SURVIVAL/2_COXPH/',instance,'/rcmm_cov/')
+} else{
+  str_c('./OUTPUT/UKB/PLOTS/4_SURVIVAL/2_COXPH/',instance,'/')
+}
+```
+
+```{r}
+multivariable_cox_results <- multivariable_cox_results %>%
+  mutate(predictor = factor(predictor, levels=c('NTPROBNP','ANGPT2','LTBP2')))
+
+# multivariable_coxph_plotter(multivariable_cox_results,path, 'ntprobnp_alloutcomes_fdr5', selected_vars=c('ntprobnp'), pp_scaling = pp_scaling,xlim=c(0,7))
+multivariable_coxph_plotter(multivariable_cox_results,path, 'allpp_alloutcomes_fdr5', pp_scaling = pp_scaling,xlim=c(0,7), save_width=12, save_height=6)
+# multivariable_coxph_plotter(multivariable_cox_results, path, 'allpp_alloutcomes_bonferroni', FDR=F, xlim=c(0,7), pp_scaling = pp_scaling)
+multivariable_coxph_plotter(multivariable_cox_results,path, 'allpp_alloutcomes_fdr5_poster', pp_scaling =T ,xlim=c(0,7), labeltext_size = 6)
+
+
+write_tsv(multivariable_cox_results, str_c(path,'multivariable_cox_results.tsv'))
+```
+
+### Cox Assumptions
+
+This tests the assumptions of the Cox regression model.
+
+#### Proportional Hazards Assumption
+
+This assumption implies the **HR measuring the effect of any predictor is constant over time**.
+
+1. Proportional Hazards assumption by testing for independence between the scaled Schoenfeld residual and the timescale.
+
+Each row represents the statistical test that the coefficient value does NOT change with respect to time (null hypothesis).
+However, you must take into account the multiple testing burden for the individual predictors.
+The GLOBAL row tests the null hypothesis that all the predictors do NOT meet the PH assumption.
+
+A non-significant result reflects that the null hypothesis is met i.e PH assumption is not invalidated.
+
+The plot of horizontal line in the plot should be flat to indicate that the assumption is met.
+
+
+```{r ph_assumptions,fig.width=9, fig.height=6}
+ph_assumption_tester <- function(model, plot_output_path='', plot=T){
+  print(plot_output_path)
+  
+  ph_assumption_test <- cox.zph(model)
+  print(ph_assumption_test)
+
+  if(isTRUE(plot)){
+     walk(rownames(ph_assumption_test$table)[1:nrow(ph_assumption_test$table)-1], ~ggcoxzph(ph_assumption_test, var=.) %>% print() 
+          #%>%
+          #  ggsave(filename=str_c(plot_output_path, '_ss.png',.), dpi=600)
+          )
+  }
+ 
+  return(ph_assumption_test)
+}
+
+ph_assumption_paths <- (expand_grid(surv_ages, pp) %>% mutate(path = str_c('OUTPUT/UKB/PLOTS/4_SURVIVAL/2_COXPH/',instance,'/ASS/', str_match(surv_ages, '^(.+)_age')[,2],'_', pp)))$path
+multivariable_cox_ph <- map2(multivariable_cox_models, ph_assumption_paths, ~ph_assumption_tester(.x, .y))
+```
+
+Sex appears to violate the PH assumption for HRC/NTproBNP x Overall Composite so I attempt to correct this here.
+N.B After RNOmni::RankNorm of the PP values, this is no longer the case.
+
+The two main ways to correct for violation of this proportional hazards assumption is
+
+1. Inclusion of an interaction term between predictor and the timescale used
+2. Stratification of a categorical predictor term
+
+The interaction term inclusion relaxes the PH assumption by accounting for a change in the coefficient (i.e hazard ratio) over the timescale e.g 
+At age 30, the hazard ratio associated with 1-year increase in age of diagnosis = 0.9 but at age 50, this might be 0.95.
+
+However, the interaction term itself assumes either a linear or other relationship between the coefficient and the timescale.
+
+It is also important to note that **by including the interaction term, the main effect term no longer represents the main effect. It instead represents the effect at timescale=0**.
+So with age at diagnosis, the hazard ratio of 0.88 represents the hazard ratio associated with 1-unit increase in diagnosis_age at birth.
+
+```{r fix_ph_assumption}
+ph_assumption_fixer <- function(data_tb, pp_of_interest, y_formula ="Surv(overallcomp_age,overallcomp_status)", predictors_to_fix=c('sex'), other_covariates = c('bmi','pc1','pc2','pc3','pc4','pc5','dbp','smoking','t2d','Townsend','eGFR','ldl'), model_return=F){
+
+  predictors_of_interest <- c(str_c(predictors_to_fix, '2'), other_covariates, pp_of_interest,str_c('tt(',predictors_to_fix, '2)'))
+  
+  x <- str_c(predictors_of_interest, collapse='+')
+  y <- y_formula
+  formula <- as.formula(paste(y,'~',x))
+  
+    for (i in seq_along(predictors_to_fix)){
+      data_tb[str_c(predictors_to_fix[i], '2')] <- data_tb[predictors_to_fix[i]]
+    
+  }
+  
+  if ('sex' %in% predictors_to_fix){
+    data_tb <- mutate(data_tb, sex2=ifelse(sex=='Male',1,0))
+  } 
+  
+
+  multivariable_cox_interactions <- coxph(formula, data=data_tb, tt=function(x,t,...) x*t) #Adds an interaction term between timescale and the predictor to try fix the PH assumption violation
+  print(summary(multivariable_cox_interactions))
+  
+  #Double check if the interaction term is valid
+  
+  # print(str_c('Showing hazard ratio associated with having Male sex over timescale with the inflection timepoint = ',signif(-1*coef(multivariable_cox_interactions)["sex2"] /
+  #   coef(multivariable_cox_interactions)["tt(sex2)"]),3)) #This is the inflection age at which the gradient is 0 i.e no variation in hazard ratio over time
+  
+  for(i in seq_along(predictors_to_fix)){
+#This plots the sum of the baseline hazard ratio (i.e main effect when timescale=0) + the time-dependent hazard ratio at each time x
+  SUB    <- ukb_tb$overallcomp_status == 1
+  TIME   <- seq(min(ukb_tb$overallcomp_age[SUB]), #Assume overallcomp
+                max(ukb_tb$overallcomp_age[SUB]), 1)
+  BETA   <- coef(multivariable_cox_interactions)[str_c(predictors_to_fix[i],'2')]
+  BETATT <- coef(multivariable_cox_interactions)[str_c('tt(',predictors_to_fix[i],'2)')]
+  AHR    <- exp(BETA + BETATT*TIME)
+  
+  plot(TIME, AHR, type = "l", xlab='Age', ylab=str_c('Hazard Ratio of ', predictors_to_fix[i]))
+  abline(h = 1, lty = 2, col = "darkgray")
+  abline(v = -1*BETA/BETATT, lty = 2, col = "darkgray")
+  }
+  
+  if(isTRUE(model_return)){
+    return(multivariable_cox_interactions)
+  }
+  
+  #This returns the coefficient values from the CoxPH model fitted
+  
+  x <- summary(multivariable_cox_interactions)
+    
+  p.value<-signif(x$coef[1:nrow(x$coef),5], digits=3)
+  beta<-signif(x$coef[1:nrow(x$coef),1], digits=3);#coeficient beta
+  HR <-signif(x$coef[1:nrow(x$coef),2], digits=3);#exp(beta) = hazard ratio
+  HR.confint.lower <- signif(x$conf.int[,"lower .95"], 3)
+  HR.confint.upper <- signif(x$conf.int[,"upper .95"],3)
+  se_beta <- signif(x$coef[1:nrow(x$coef),3], digits=3)
+  vars <- rownames(x$coef)
+  
+  res<-bind_cols(vars,beta, se_beta, HR, HR.confint.lower, HR.confint.upper, p.value) %>%
+    mutate(predictor=str_to_upper(vars)) 
+  
+  names(res)<-c('var',"beta",'se_beta', "HR", "Lower_95CI_HR","Upper_95CI_HR", 
+            "p.value", 'predictor')
+  
+  return(res)
+
+}
+
+# td_covar_ntprobnp_overallcomp <- ph_assumption_fixer(ukb_tb, 'ntprobnp') %>% mutate(outcome='OVERALL')
+# td_covar_hrc_overallcomp <-ph_assumption_fixer(ukb_tb, 'hrc', predictors_to_fix=c('sex','bmi')) %>% mutate(outcome='OVERALL')
+# 
+# #Update multivariable cox results with these adjusted 
+# multivariable_cox_results_timeadj <- multivariable_cox_results %>%
+#   filter(!(var %in% c('ntprobnp','hrc') & outcome=='OVERALL')) %>%
+#   bind_rows(filter(td_covar_ntprobnp_overallcomp, var=='ntprobnp')) %>%
+#   bind_rows(filter(td_covar_hrc_overallcomp, var=='hrc')) %>%
+#   mutate(outcome=factor(outcome, levels=c('VA','HF','OVERALL')))
+# 
+# rm(list=ls(pattern='td_covar'))
+# 
+# #Replot the summary
+# multivariable_coxph_plotter(multivariable_cox_results_timeadj,str_c('./OUTPUT/UKB/PLOTS/4_SURVIVAL/2_COXPH/',instance,'/'), 'ntprobnp_hrc_alloutcomes_fdr5_timeadj')
+# multivariable_coxph_plotter(multivariable_cox_results_timeadj,str_c('./OUTPUT/UKB/PLOTS/4_SURVIVAL/2_COXPH/',instance,'/'), 'ntprobnp_hrc_alloutcomes_bonferroni_timeadj', FDR=F)
+# 
+# #These output the models itself
+# td_covar_ntprobnp_overallcomp_model <- ph_assumption_fixer(ukb_tb, 'ntprobnp', model_return=T)
+# td_covar_hrc_overallcomp_model <-ph_assumption_fixer(ukb_tb, 'hrc', predictors_to_fix=c('sex','bmi'), model_return=T)
+
+```
+
+#### Influential Observations
+
+This looks at the influential observations e.g outliers/high-leverage observations which may influence the model.
+
+The first plots show the estimated changes in the regression coefficients by deleting each observation in turn.
+Ideally, you want the largest y-values in these plots to be << actual coefficients for the predictor. A large value would indicate that deleting that observation shifts the coefficient substantially (relative to the actual coefficient).
+
+```{r dfbeta, fig.width=15, fig.height=15, message=F, warning=F}
+#If not correcting as above block
+td_covar_ntprobnp_overallcomp_model <- multivariable_cox_models[[5]]
+td_covar_hrc_overallcomp_model <- multivariable_cox_models[[6]]
+
+
+print(summary(td_covar_ntprobnp_overallcomp_model)) #These are the actual coefficients
+
+#This is for the NTproBNP x overall comp
+print(ggcoxdiagnostics(td_covar_ntprobnp_overallcomp_model, type = "dfbeta",
+                 linear.predictions = FALSE, ggtheme = theme_classic()))
+
+print(summary(td_covar_hrc_overallcomp_model)) #These are the actual coefficients
+
+#This is for the HRCx overall comp
+print(ggcoxdiagnostics(td_covar_hrc_overallcomp_model, type = "dfbeta",
+                 linear.predictions = FALSE, ggtheme = theme_classic()))
+```
+
+The second plots show the deviance residuals such that positive values = individuals that 'died too soon' compared to expected survival time, negative values = individuals that 'lived too long' so presence of very large or very small values indicates outliers.
+
+Ideally the residuals should be symmetrical about 0.
+
+```{r deviance, fig.width=7, fig.height=7, message=F, warning=F}
+# print(ggcoxdiagnostics(multivariable_cox, type = "deviance",
+#                  linear.predictions = FALSE, ggtheme = theme_bw()))
+```
+
+#### Linearity Assumption
+
+I also test for non-linearity as the Cox regression model assumes linear relationship between the response and the predictor variables.
+
+This is tested for the **continuous predictors** by plotting the Martingale residuals against the continuous predictors. Their values range from -Infinity to +1 such that a value near 1 suggests individuals that 'died too soon' and a large negative value indicates individuals that 'lived too long'.
+
+The expected line for a linear relationship = straight horizontal line at y=0.
+
+Note that linearity does not influence categorical variables.
+
+The resultant line (fitted with loess) should be linear to satisfy the linearity assumption.
+
+```{r martingale, fig.width=7, fig.height=7}
+#' Plot Martingale Residuals vs. Covariate using ggplot2
+#'
+#' Creates a scatter plot of Martingale residuals against a specified continuous
+#' covariate from a Cox model to visually assess the linearity assumption.
+#' Includes a LOESS smoother and an option to save the plot.
+#'
+#' @param fit A fitted Cox model object (from `coxph`).
+#' @param data The dataframe used to fit the model.
+#' @param covariate_name A string specifying the column name in `data` for the
+#'   continuous covariate to be plotted on the x-axis.
+#' @param save_plot Logical. If TRUE, saves the plot to a file. Defaults to FALSE.
+#' @param filename String. The name (including path and extension, e.g., "plots/linearity_X.png")
+#'   to save the plot under. Required if `save_plot` is TRUE. Defaults to NULL.
+#' @param width Numeric. Width of the saved plot (in units specified by `units`). Defaults to 7.
+#' @param height Numeric. Height of the saved plot (in units specified by `units`). Defaults to 5.
+#' @param dpi Numeric. Resolution for raster plots. Defaults to 300.
+#' @param units String. Units for width and height ("in", "cm", "mm"). Defaults to "in".
+#'
+#' @return A ggplot object representing the plot. If `save_plot` is TRUE, the
+#'   plot is also saved to the specified file.
+#' @export
+#' @import ggplot2
+#' @importFrom survival residuals
+#'
+#' @examples
+#' if (require(survival) && require(ggplot2)) {
+#'   # Use lung dataset as an example
+#'   data(lung)
+#'   # Make status numeric 0/1 (assuming 1=censored, 2=dead -> 0=censored, 1=dead)
+#'   lung$status <- ifelse(lung$status == 1, 0, 1)
+#'
+#'   # Fit a Cox model (example: check linearity for age)
+#'   fit_lung <- coxph(Surv(time, status) ~ age + sex + ph.ecog, data = lung)
+#'
+#'   # Create the plot (don't save in example)
+#'   p <- plot_martingale_linearity(fit_lung, lung, "age", save_plot = FALSE)
+#'   print(p)
+#'
+#'   # To save (example - uncomment and set path if needed):
+#'   # plot_martingale_linearity(fit_lung, lung, "age", save_plot = TRUE,
+#'   #                          filename = "martingale_vs_age_linearity.png")
+#' }
+plot_martingale_linearity <- function(data,
+                                      fit,
+                                      covariate_name,
+                                      outcome_name,
+                                      plot_output_path='OUTPUT/UKB/PLOTS/4_SURVIVAL/2_COXPH/3_TOTAL/rcmm_cov/ass/',
+                                      save_plot = T,
+                                      width = 7,
+                                      height = 5,
+                                      dpi = 600,
+                                      units = "in") {
+
+  # --- Input Checks ---
+  if (!inherits(fit, "coxph")) {
+    stop("Input 'fit' must be a coxph model object.")
+  }
+  if (!is.data.frame(data)) {
+    stop("Input 'data' must be a data frame.")
+  }
+  if (!is.character(covariate_name) || length(covariate_name) != 1 || !nzchar(covariate_name)) {
+    stop("'covariate_name' must be a single, non-empty string.")
+  }
+  if (!covariate_name %in% names(data)) {
+    stop("Column '", covariate_name, "' not found in the provided 'data'.")
+  }
+  if (!is.numeric(data[[covariate_name]])) {
+      warning("Covariate '", covariate_name, "' is not numeric. Plot might be misleading.")
+  }
+
+  # --- Load required package ---
+   if (!requireNamespace("ggplot2", quietly = TRUE)) {
+      stop("Package 'ggplot2' must be installed to use this function.", call. = FALSE)
+   }
+    # Ensure survival is loaded for residuals() - might be redundant if fit exists
+   if (!requireNamespace("survival", quietly = TRUE)) {
+       stop("Package 'survival' must be installed to use this function.", call. = FALSE)
+   }
+
+
+  # --- Calculations ---
+  martingale_res <- tryCatch(
+      residuals(fit, type = "martingale"),
+      error = function(e) {
+          stop("Could not calculate Martingale residuals from the fitted model: ", e$message)
+      }
+  )
+
+  # Ensure covariate data is available and has same length as residuals
+  if (length(martingale_res) != nrow(data)) {
+       # This might happen if the fit used options like na.action=na.exclude
+       # Try to get row numbers used in the fit
+       fit_rows <- tryCatch(as.numeric(names(fit$residuals)), warning=function(w) NULL) # martingale res often unnamed
+       if(is.null(fit_rows)) fit_rows <- tryCatch(as.numeric(names(fit$linear.predictors)), warning=function(w) NULL)
+       if(is.null(fit_rows)) fit_rows <- 1:nrow(data) # Fallback - might be wrong if NAs
+
+        if(length(martingale_res) == length(fit_rows)){
+             warning("Length mismatch between residuals and original data. Attempting alignment based on fit object. Check results carefully.")
+             plot_data <- data.frame(
+               covariate = data[[covariate_name]][fit_rows],
+               martingale_res = martingale_res
+             )
+             names(plot_data)[1] <- covariate_name # Rename column dynamically
+        } else {
+            stop("Length mismatch between Martingale residuals (", length(martingale_res),
+                 ") and data (", nrow(data), "). This might be due to NA handling during model fitting.")
+        }
+  } else {
+       plot_data <- data.frame(
+         covariate = data[[covariate_name]],
+         martingale_res = martingale_res
+       )
+        names(plot_data)[1] <- covariate_name # Rename column dynamically
+  }
+
+
+  # --- Create Plot ---
+  gg_plot <- ggplot2::ggplot(plot_data, ggplot2::aes(x = .data[[covariate_name]], y = martingale_res)) +
+    ggplot2::geom_point(alpha = 0.5, shape = 16) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    ggplot2::geom_smooth(method = "loess", formula = 'y ~ x', se = FALSE, color = "blue", linewidth = 1) + # Explicit formula
+    ggplot2::labs(
+      title = paste("Martingale Residuals vs.", covariate_name, 'for outcome', outcome_name),
+      subtitle = "Check for Linearity Assumption in Cox Model",
+      x = covariate_name,
+      y = "Martingale Residuals"
+    ) +
+    ggplot2::theme_classic()
+  
+  print(gg_plot)
+
+  # --- Save Plot (Optional) ---
+  if (save_plot) {
+    filename <- str_c(plot_output_path, covariate_name, '_x_',outcome_name,'_martingale.png', collapse='')
+     tryCatch({
+       ggplot2::ggsave(
+         filename = filename,
+         plot = gg_plot,
+         width = width,
+         height = height,
+         dpi = dpi,
+         units = units,
+         bg = "white" # Ensure background for png/jpg
+       )
+       message("Plot saved successfully to: ", filename)
+     }, error = function(e) {
+        warning("Failed to save plot to '", filename, "': ", e$message)
+     })
+  }
+
+  # --- Return ggplot object ---
+  return(gg_plot)
+}
+
+#For VACOMP
+walk2(multivariable_cox_models[1:3],pp, ~plot_martingale_linearity(ukb_pp_hcm_outcome_tbs[[1]],..1,..2,'VACOMP'))
+walk2(multivariable_cox_models[4:6],pp, ~plot_martingale_linearity(ukb_pp_hcm_outcome_tbs[[2]],..1,..2,'HFCOMP'))
+walk2(multivariable_cox_models[7:9],pp, ~plot_martingale_linearity(ukb_pp_hcm_outcome_tbs[[3]],..1,..2,'OVERALLCOMP'))
+
+```
+
+```{r}
+sessionInfo()
+```
+
+
+# Archived
+
+Age at diagnosis as well as sex appear to violate the PH assumption so I attempt to correct this here.
+
+The two main ways to correct for violation of this proportional hazards assumption is
+
+1. Inclusion of an interaction term between predictor and the timescale used
+2. Stratification of a categorical predictor term
+
+The interaction term inclusion relaxes the PH assumption by accounting for a change in the coefficient (i.e hazard ratio) over the timescale e.g 
+At age 30, the hazard ratio associated with 1-year increase in age of diagnosis = 0.9 but at age 50, this might be 0.95.
+
+However, the interaction term itself assumes either a linear or other relationship between the coefficient and the timescale.
+
+It is also important to note that **by including the interaction term, the main effect term no longer represents the main effect. It instead represents the effect at timescale=0**.
+So with age at diagnosis, the hazard ratio of 0.88 represents the hazard ratio associated with 1-unit increase in diagnosis_age at birth.
+
+```{r fix_ph_assumption}
+predictors_of_interest <- c('diagnosis_age2','sex2',
+                            #str_c('PC',seq(1,5)),
+                            'bmi','sbp','cv_prs','ALL_P_LP_LOFTEE','ALL_VUS_COMPMASK80',
+                            'tt(diagnosis_age2)','tt(sex2)')
+
+x <- str_c(predictors_of_interest, collapse='+')
+y <- "Surv(lastfollowup_age,status)"
+formula <- as.formula(paste(y,'~',x))
+
+multivariable_cox_interactions <- coxph(formula, data=mutate(ukb_tb, diagnosis_age2=diagnosis_age,sex2=ifelse(sex=='Male',1,0)), tt=function(x,t,...) x*t) #Adds an interaction term between timescale and the predictor to try fix the PH assumption violation
+print(summary(multivariable_cox_interactions))
+```
+
+The p-values for tt(diagnosis_age) and tt(sex2) show the statistical test for whether the interaction is significant (i.e if the linear change in the coefficient with respect to timescale is significantly different from 0). 
+
+A significant result means that the proportional hazards assumption is indeed incorrect and there is a significant linear change in the hazard ratio with respect to timescale.
+
+```{r fix_ph_assumption_plot_diagnosisage}
+#From https://www.bookdown.org/rwnahhas/RMPH/survival-phassumption.html
+#This outputs the timescale point at which the hazard ratio's direction of association changes
+
+print(str_c('Showing hazard ratio associated with 1-unit increase in diagnosis_age over timescale with the inflection timepoint = ',
+      signif(-1*coef(multivariable_cox_interactions)["diagnosis_age2"] /
+  coef(multivariable_cox_interactions)["tt(diagnosis_age2)"]),3))
+
+# Range of observed event times
+SUB    <- ukb_tb$status == 1
+TIME   <- seq(min(ukb_tb$lastfollowup_age[SUB]),
+              max(ukb_tb$lastfollowup_age[SUB]), 1)
+BETA   <- coef(multivariable_cox_interactions)["diagnosis_age2"]
+BETATT <- coef(multivariable_cox_interactions)["tt(diagnosis_age2)"]
+AHR    <- exp(BETA + BETATT*TIME)
+plot(TIME, AHR, type = "l", xlab='Age', ylab='Hazard Ratio of Those Differing by 1-Unit in Diagnosis Age')
+abline(h = 1, lty = 2, col = "darkgray")
+abline(v = -1*BETA/BETATT, lty = 2, col = "darkgray")
+```
+The increase of the line with age shows that as the age/timescale increases, the hazard ratio associated with 1-unit increase in age of diagnosis increases. This suggests that age of diagnosis affects patients more when they are young (when a 1-unit increase in age of diagnosis has more of a protective effect).
+
+```{r fix_ph_assumption_plot_sex2}
+print(str_c('Showing hazard ratio associated with having Male sex over timescale with the inflection timepoint = ',signif(-1*coef(multivariable_cox_interactions)["sex2"] /
+  coef(multivariable_cox_interactions)["tt(sex2)"]),3))
+
+
+# Range of observed event times
+SUB    <- ukb_tb$status == 1
+TIME   <- seq(min(ukb_tb$lastfollowup_age[SUB]),
+              max(ukb_tb$lastfollowup_age[SUB]), 1)
+BETA   <- coef(multivariable_cox_interactions)["sex2"]
+BETATT <- coef(multivariable_cox_interactions)["tt(sex2)"]
+AHR    <- exp(BETA + BETATT*TIME)
+plot(TIME, AHR, type = "l", xlab='Age', ylab='Hazard Ratio of having Male Sex')
+abline(h = 1, lty = 2, col = "darkgray")
+abline(v = -1*BETA/BETATT, lty = 2, col = "darkgray")
+```
+The decrease of the line with age shows that as the age/timescale increases, the hazard ratio associated with having male sex decreases towards 1. This suggests that sex affects patients more when they are young (when being Male has more of a harmful effect).
+
+**Ultimately, by including these time interaction effects you relax the proportional hazards assumption for the Cox regression model to incorporate time-varying predictors('covariates' in survival analysis nomenclature). I replot the summary graph to show the significant predictors**
+
+```{r replot_multivariable_cox, message=F, warning=F, fig.width=12, fig.height=6}
+multivariable_cox_tb2 <- summary_cox_tb_gen(summary(multivariable_cox_interactions)) %>%
+  mutate(label=predictors_xlabel_tb$Label[match(var, predictors_xlabel_tb$Variable)]) %>%
+  mutate(label=ifelse(is.na(label), var, label))
+
+multivariable_plot2 <- ggplot(filter(multivariable_cox_tb2, !str_detect(var,'PC')), aes(HR,-log10(p.value)))+ #Plot without PCs
+  geom_vline(xintercept=1, linetype='dashed',alpha=0.5)+
+  geom_hline(yintercept=-log10(0.05/nrow(multivariable_cox_tb2)), linetype='dashed', alpha=0.5)+
+  geom_point(aes(col=label),alpha=0.75)+
+  geom_errorbar(aes(xmin=Lower_95CI_HR, xmax=Upper_95CI_HR,col=label),alpha=0.75)+
+  scale_colour_brewer(name='Predictor',palette='Paired')+
+  geom_text_repel(aes(label=HR))+
+  xlab('Hazard Ratio')+
+  ylab('-log10 (Wald-test p value)')+
+  scale_x_continuous(n.breaks=10)+
+  labs(title=str_c('multivariable Cox Regression analysis for ', nrow(multivariable_cox_tb2), 
+                   #' (including 5 common variant PCs)', 
+                   ' predictors for overall composite outcome'),caption='Bonferroni-corrected p-value threshold indicated')+
+  theme(legend.position="bottom")+
+   guides(col=guide_legend(nrow=4, byrow=TRUE)) 
+
+print(multivariable_plot2)
+ggsave('../OUTPUT/PLOTS/3_COXPH/2_multivariable/UKB/multivariable_interactions_pval_hr.png', dpi=600, width=12, height=6)
+
+rm(multivariable_plot2)
+```
+
+### Cox Regression 
+Try with only HRC x AF outcome.
+
+```{r}
+# multivariable_cox(input_tb = ukb_tb, marginal_predictor = 'hrc',covariates = covariates,status = 'af_status',outcome_var = 'af_age',outcome_levels = 'AF')
+```
+
+#### Joint multivariable Cox
+```{r}
+#Run joint Cox regression models (i.e all plasma proteins modelled together)
+#Evaluate pairwise correlation between NTproBNP and HRC
+cor(ukb_tb$ntprobnp, ukb_tb$hrc, method='spearman', use='pairwise.complete.obs') #0.6 correlation so some degree of multicollinearity so should be ok
+# cor(ukb_tb$ntprobnp, ukb_tb$ace2, method='spearman', use='pairwise.complete.obs')
+
+joint_cox_results <- bind_rows(
+  multivariable_cox(ukb_tb,pp,covariates,statuses[1],surv_ages[1], return_predictor_results_only = F),
+  multivariable_cox(ukb_tb,pp,covariates,statuses[2],surv_ages[2], return_predictor_results_only = F),
+  multivariable_cox(ukb_tb,pp,covariates,statuses[3],surv_ages[3], return_predictor_results_only = F)
+) %>%
+  bind_rows() %>%
+  filter(!is.na(p.value)) %>%
+  filter(var %in% pp)
+
+joint_cox_model_overallcomp <- multivariable_cox(ukb_tb,pp,covariates,statuses[3],surv_ages[3], return_model=T)
+ntprobnp_model_overallcomp <- multivariable_cox(filter(ukb_tb, !is.na(hrc)),'ntprobnp',covariates,statuses[3],surv_ages[3], return_model=T) #Need to fit to the same dataset size for ANOVA
+
+anova(ntprobnp_model_overallcomp, joint_cox_model_overallcomp) #ANOVA of the two models to see if the added model explains greater variance than the previous model with just NTproBNP
+
+
+```
+
+
+
+### Time-Dependent Covariates
+
+This implements the time-dependent nature of the covariates such as plasma protein measurement itself and other time-dependent covariates such as DBP, BMI.
+
+```{r}
+#' Add a Baseline Covariate as a Time-Dependent Covariate Active After Recruitment Age
+#'
+#' Modifies a time-dependent dataset (in start/stop format from tmerge) to include
+#' a covariate whose value is taken from baseline (measured at recruitment) but
+#' only applies to the person-time intervals at or after the recruitment age/time.
+#'
+#' @param td_data The time-dependent dataset (must be a data frame, likely an
+#'   output from previous `tmerge` calls). It must contain the columns specified
+#'   by `id_col` and `covariate_col`. Time intervals (e.g., 'start_age', 'stop_age')
+#'   should already be defined.
+#' @param start_data The baseline dataset (must be a data frame) containing one
+#'   row per unique subject ID. Must contain the columns specified by `id_col`
+#'   and `recruitment_age_col`.
+#' @param id_col Character string. Name of the unique subject identifier column
+#'   present in BOTH `td_data` and `start_data`.
+#' @param recruitment_age_col Character string. Name of the column in `start_data`
+#'   indicating the age/time at which recruitment occurred.
+#' @param covariate_col Character string. Name of the column containing the
+#'   *value* of the baseline covariate. This column must exist in `td_data`
+#'   (e.g., added via tmerge with कुत्ते() beforehand).
+#' @param new_tdc_name Character string. The desired name for the new
+#'   time-dependent covariate column to be created in `td_data`.
+#' @param value_before_recruitment The numeric or NA value the new TDC should have
+#'   in intervals *before* the time specified by `recruitment_age_col`. Defaults to 0.
+#'
+#' @return A data frame: the modified `td_data` with the new time-dependent
+#'   covariate column (`new_tdc_name`). Intervals will be split at
+#'   `recruitment_age_col` times derived from `start_data`.
+#'
+#' @details This function uses `tmerge` to add a temporary indicator variable
+#'   that switches from 0 to 1 at the time specified by `recruitment_age_col`
+#'   (sourced from `start_data`). This splits the time intervals in `td_data`
+#'   accordingly. It then uses this indicator to create the final `new_tdc_name`
+#'   column, assigning `value_before_recruitment` before the split time and the
+#'   value from `covariate_col` (which must already be present in `td_data`)
+#'   at or after the split time.
+#'
+#' @examples
+#' \dontrun{
+#' # Assume 'start_data' has id, recruitment_age, bmi_at_recruitment, sex, hcm_diag_age etc.
+#' # Assume 'td_data_initial' is created from start_data with tmerge for events:
+#' # td_data_initial <- tmerge(start_data, start_data, id=id, tstart=0, tstop=last_followup_age,
+#' #                           hf_event=event(hf_age))
+#' # # Add necessary baseline VALUE column(s) needed for the function call to td_data:
+#' # # Crucially, 'bmi_at_recruitment' value must be in td_data before calling the function.
+#' # td_data_prepared <- tmerge(td_data_initial, start_data, id=id,
+#' #                            bmi_at_recruitment = कुत्ते(bmi_at_recruitment),
+#' #                            sex = कुत्ते(sex))
+#' # # Add other TDCs like hcm_status if needed
+#' # td_data_prepared <- tmerge(td_data_prepared, start_data, id=id,
+#' #                           hcm_status = tdc(hcm_diag_age, 0))
+#'
+#' # Now use the function to create the time-dependent BMI
+#' td_data_final <- add_baseline_as_tdc(
+#'   td_data = td_data_prepared,      # Input data with required value columns
+#'   start_data = start_data,       # Baseline data with recruitment age
+#'   id_col = "id",
+#'   recruitment_age_col = "recruitment_age", # Column name in start_data
+#'   covariate_col = "bmi_at_recruitment",    # Column name (value) in td_data
+#'   new_tdc_name = "td_bmi",                 # New column name for the model
+#'   value_before_recruitment = 0             # Use 0 for BMI before recruitment
+#' )
+#'
+#' # Check the result for a sample patient
+#' # print(subset(td_data_final, id == some_id))
+#'
+#' # Fit model
+#' # library(survival)
+#' # Rename time columns if needed, e.g., to start_age, stop_age
+#' # colnames(td_data_final)[colnames(td_data_final) == "tstart"] <- "start_age"
+#' # colnames(td_data_final)[colnames(td_data_final) == "tstop"] <- "stop_age"
+#' # cox_model <- coxph(Surv(start_age, stop_age, hf_event) ~ td_bmi + hcm_status + sex,
+#' #                    data = td_data_final)
+#' # summary(cox_model)
+#' }
+#'
+#' @seealso \code{\link[survival]{tmerge}}, \code{\link[survival]{tdc}}, \code{\link[survival]{कुत्ते}}
+#' @importFrom survival tmerge tdc
+#' @export
+
+add_baseline_as_tdc <- function(td_data,
+                                  start_data, # Added start_data argument
+                                  id_col,
+                                  recruitment_age_col, # Exists in start_data
+                                  covariate_col,       # Exists in td_data (value col)
+                                  new_tdc_name,
+                                  value_before_recruitment = 0) {
+
+  # --- Input Checks ---
+  if (!is.data.frame(td_data)) stop("td_data must be a data frame.")
+  if (!is.data.frame(start_data)) stop("start_data must be a data frame.")
+  if (!(id_col %in% names(td_data))) stop("td_data must contain id column: ", id_col)
+  if (!(id_col %in% names(start_data))) stop("start_data must contain id column: ", id_col)
+  if (!(recruitment_age_col %in% names(start_data))) {
+      stop("start_data must contain column: ", recruitment_age_col)
+  }
+  if (!(covariate_col %in% names(td_data))) {
+     stop("td_data must contain column: ", covariate_col,
+          ". Ensure it was added (e.g., via tmerge with कुत्ते()).")
+  }
+  if (any(duplicated(start_data[[id_col]]))) {
+      warning("start_data contains duplicate IDs. Using first match for tdc time points.")
+      start_data <- start_data[!duplicated(start_data[[id_col]]), ] # Keep first match
+  }
+  if (!is.numeric(value_before_recruitment) && !is.na(value_before_recruitment)) {
+       stop("value_before_recruitment must be numeric or NA.")
+  }
+  if (!is.character(new_tdc_name) || length(new_tdc_name) != 1 || nchar(new_tdc_name) == 0) {
+      stop("new_tdc_name must be a non-empty character string.")
+  }
+
+  # --- Create Intermediate 'Active' Indicator ---
+  temp_active_indicator_name <- paste0(".__", gsub("[^[:alnum:]_]", "", new_tdc_name), "_active_indicator__.", sample.int(1e6, 1))
+  while (temp_active_indicator_name %in% names(td_data)) {
+     temp_active_indicator_name <- paste0(".__", gsub("[^[:alnum:]_]", "", new_tdc_name), "_active_indicator__.", sample.int(1e6, 1))
+  }
+  message(paste("Creating temporary indicator:", temp_active_indicator_name))
+
+  # Create the indicator splitting intervals at recruitment_age_col sourced from start_data
+  # Pass the *name* of the recruitment age column to tdc()
+  td_data <- tmerge(data1 = td_data,
+                              data2 = start_data,       # Use baseline data as source for tdc time
+                              id = ID,
+                              indicator_placeholder = tdc(get(recruitment_age_col)))
+
+  # Rename the newly created column
+  names(td_data)[names(td_data) == "indicator_placeholder"] <- temp_active_indicator_name
+
+  # --- Create the Final Time-Dependent Covariate Column ---
+   if (new_tdc_name %in% names(td_data)) {
+     warning("Column '", new_tdc_name, "' already exists in td_data. It will be overwritten.")
+   }
+
+  # Use the indicator: if 1 (at/after recruitment), use baseline covariate value (already in td_data); otherwise use placeholder.
+  td_data[[new_tdc_name]] <- ifelse(td_data[[temp_active_indicator_name]] == 1,
+                                    td_data[[covariate_col]],
+                                    value_before_recruitment)
+
+  # --- Clean Up Intermediate Column ---
+  td_data[[temp_active_indicator_name]] <- NULL
+  message(paste("Removed temporary indicator:", temp_active_indicator_name))
+
+  # --- Return Modified Data ---
+  return(td_data)
+}
+```
+
+```{r}
+#Test for overallcomp x NTproBNP
+
+# Initialize the dataset for tmerge with baseline data and the final outcome time
+# Use age-from-birth as the time scale
+td_data <- tmerge(data1 = ukb_tb, # Initial dataset
+                  data2 = ukb_tb, # Can be the same or another dataset for events/covariates
+                  id = ID,            # Patient identifier
+                  tstart = age_attend_i0, # Start of follow-up time (using age) i.e birth for this biobank study
+                  tstop = overallcomp_age, # End of follow-up time (age at HF or censoring)
+                  overallcomp_event = event(overallcomp_age)) # Define the outcome event (HF) based on hf_age
+
+td_data <- add_baseline_as_tdc(
+  td_data = td_data, # Input data with required columns
+  start_data = ukb_tb,
+  id_col = "ID",
+  recruitment_age_col = "age_attend_i0",
+  covariate_col = "bmi", # The column with the value measured at recruitment
+  new_tdc_name = "td_bmi",          # The name for the new TDC column in the output
+  value_before_recruitment = NA      # Value before recruitment_age (e.g., 0 or NA)
+)
+
+td_data <- add_baseline_as_tdc(
+  td_data = td_data, # Input data with required columns
+  start_data = ukb_tb,
+  id_col = "ID",
+  recruitment_age_col = "age_attend_i0",
+  covariate_col = "dbp", # The column with the value measured at recruitment
+  new_tdc_name = "td_dbp",          # The name for the new TDC column in the output
+  value_before_recruitment = NA      # Value before recruitment_age (e.g., 0 or NA)
+)
+
+td_data <- add_baseline_as_tdc(
+  td_data = td_data, # Input data with required columns
+  start_data = ukb_tb,
+  id_col = "ID",
+  recruitment_age_col = "blood_sample_age",
+  covariate_col = "ntprobnp", # The column with the value measured at recruitment
+  new_tdc_name = "td_ntprobnp",          # The name for the new TDC column in the output
+  value_before_recruitment = NA      # Value before recruitment_age (e.g., 0 or NA)
+)
+
+# Rename columns to match the Surv formula expectation (start_age, stop_age)
+colnames(td_data)[colnames(td_data) == "tstart"] <- "start_age"
+colnames(td_data)[colnames(td_data) == "tstop"] <- "stop_age"
+
+#Perform Cox regression with the time-dependent covariates
+x <- str_c(c(c('sex','pc1','pc2','pc3','pc4','pc5', 'td_dbp','td_bmi'),'td_ntprobnp'), collapse='+')
+y <- 'Surv(start_age, stop_age, overallcomp_event)'
+formula <- as.formula(paste(y,'~',x))
+
+cox_model_overallcomp_x_ntprobnp <- coxph(formula, data = td_data, id = ID)
+print(summary(cox_model_overallcomp_x_ntprobnp))
+
+```

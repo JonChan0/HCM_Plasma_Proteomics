@@ -1,0 +1,69 @@
+---
+title: "ukb_plasma_proteomics_analysis"
+author: "Jonathan Chan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tictoc)
+library(ggrepel)
+library(ggsignif)
+library(car)
+library(readxl)
+rm(list=ls())
+
+theme_set(theme_classic(base_size=14))
+
+date <- as.POSIXlt(Sys.time(), 'UTC')
+date <- strftime(date, "%Y%m%dT%H:%M:%S%z")
+date <- str_match(date,'^(\\d+)T')[,2]
+```
+
+## Import
+
+```{r}
+pp_names <- c(
+    'N-terminal pro-BNP' = 'NTproBNP',
+    'Angiopoietin-2' = 'ANGPT2',
+    'Troponin I' = 'TNNI3',
+    'Troponin T' = 'TNNT2'
+)
+
+decode_data <- read_excel('DATA/DeCODE_Genetics/results.hcm.somascan_iceland.case_control_analysis.20250924.xlsx') %>%
+    filter(str_detect(description, 'diagnosis before sampling')) %>%
+    mutate(adj_pval = p.adjust(pval_inv_normal_adj,method='BH')) %>%
+    mutate(fdr_sig = ifelse(adj_pval <= 0.05,T,F)) %>%
+    filter(Target %in% c('N-terminal pro-BNP','Angiopoietin-2','Troponin I','Troponin T')) #Either pass 10% FDR relaxed threshold in UKB case-control association analysis OR TNNT2 (which is positive control but not measured in UKB)
+```
+
+
+```{r}
+scatter_interim <- ggplot(decode_data,aes(x=beta_inv_normal, y = -log10(adj_pval)))+
+    geom_hline(yintercept = -log10(0.05), linetype='dashed',col='black', alpha=0.75)+
+    geom_vline(xintercept=0, linetype='dashed', col='black', alpha=0.75)+
+    geom_point(aes(col=fdr_sig))+
+    xlab('Beta (SD Difference for Cases vs. Controls)')+
+    ylab('-log10(Adjusted p-value)')+
+    labs(title = str_glue('DeCODE Genetics Plasma Proteomic (n = {decode_data$n_total}) Case-Control Replication Analysis'), subtitle = str_wrap('Protein levels inverse rank-normalised; test statistics inflation adjusted via lambda; MTC via BH method', width=80))+
+    scale_color_manual(labels=pp_names,values=c('black','red'))+
+    theme(legend.position='none')
+
+scatter <- scatter_interim +
+    geom_text_repel(aes(label=pp_names, col=fdr_sig))
+
+
+print(scatter)
+ggsave('OUTPUT/DeCODE_Genetics/scatter.png', dpi=600, height=6, width=9)
+
+#For poster, increase the font size
+scatter_poster <- scatter_interim +
+    theme(text = element_text(size=16))+
+    geom_text_repel(aes(label=pp_names, col=fdr_sig), size=8)
+
+print(scatter_poster)
+ggsave('OUTPUT/DeCODE_Genetics/scatter_poster.png', dpi=600, height=6, width=12)
+```
