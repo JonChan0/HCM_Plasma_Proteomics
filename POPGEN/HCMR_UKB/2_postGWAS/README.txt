@@ -1,0 +1,1 @@
+The overall Snakemake pipeline to output Manhattan, QQplot/p-value historgrams and LocusZoom plots is `manhattan_qcplot.smk` whereas the scripts/* provide auxiliary scripts.

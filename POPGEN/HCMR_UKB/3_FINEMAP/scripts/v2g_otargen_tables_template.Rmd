@@ -1,0 +1,25 @@
+---
+title: "V2G_Otargen_Tables"
+author: "Jonathan Chan"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  leadvar: '?'
+  tssd: '?'
+  qtls: '?'
+  chromatin: '?'
+---
+
+```{r}
+print(str_c('Supporting Evidence Tables from Open Target Genetics L2G Pipeline for ', params$leadvar)) #Note first number refers to the genomic region
+
+# Placeholder for Tibble 1
+knitr::kable(params$tssd, caption = "Colocalisation Scores")
+
+# Placeholder for Tibble 1
+knitr::kable(params$qtls, caption = "QTLs")
+
+# Placeholder for Tibble 1
+knitr::kable(params$chromatin, caption = "Chromatin Interaction Data")
+```
+
