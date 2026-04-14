@@ -37,7 +37,7 @@ decode_data <- read_excel('DATA/DeCODE_Genetics/results.hcm.somascan_iceland.cas
     filter(str_detect(description, 'diagnosis before sampling')) %>%
     mutate(adj_pval = p.adjust(pval_inv_normal_adj,method='BH')) %>%
     mutate(fdr_sig = ifelse(adj_pval <= 0.05,T,F)) %>%
-    filter(Target %in% c('N-terminal pro-BNP','Angiopoietin-2','Troponin I','Troponin T')) #Either pass 10% FDR relaxed threshold in UKB case-control association analysis OR TNNT2 (which is positive control but not measured in UKB)
+    filter(Target %in% c('N-terminal pro-BNP','Angiopoietin-2','Troponin I','Troponin T'))
 ```
 
 

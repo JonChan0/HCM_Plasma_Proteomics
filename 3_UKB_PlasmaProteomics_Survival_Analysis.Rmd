@@ -868,6 +868,14 @@ Here I perform multivariable Cox regression using covariates and with each of th
 ```{r multivariable_cox, message=F, warning=F}
 multivariable_cox <- function(input_tb, marginal_predictor, covariates, status, outcome_var, baseline_age='age_attend_i0', outcome_levels=c('VA','HF','OVERALL'), return_predictor_results_only=T, return_model=F){ #Return only the coefficient and p-values for the marginal_predictor
   
+  #First I run a linear regression between covariates and marginal predictor to estimate the R-squared for this protein (i.e. variance inflation factor)
+  # 1. Construct the formula: Protein ~ Covariate1 + Covariate2 + ...
+  x <- str_c(covariates, collapse='+')
+  formula_str <- paste(marginal_predictor, '~', x)
+  formula <- as.formula(formula_str)
+  lm_model <- lm(formula, data = input_tb, na.action=na.omit)
+  pp_cov_r_squared <- summary(lm_model)$r.squared
+
   x <- str_c(c(covariates,marginal_predictor), collapse='+')
   y <- str_c('Surv(',baseline_age, ',', outcome_var,',',status,')')
   formula <- as.formula(paste(y,'~',x))
@@ -902,14 +910,14 @@ multivariable_cox <- function(input_tb, marginal_predictor, covariates, status, 
 
   }
   
-  res<-bind_cols(vars,beta, se_beta, HR, HR.confint.lower, HR.confint.upper, p.value) %>%
+  res<-bind_cols(vars,beta, se_beta, HR, HR.confint.lower, HR.confint.upper, p.value,pp_cov_r_squared) %>%
     mutate(predictor=str_to_upper(vars)) %>%
     mutate(outcome = factor(
       str_to_upper(str_match(outcome_var,'(.+)comp_age')[,2]),levels=outcome_levels, ordered=T
     ))
   
   names(res)<-c('var',"beta",'se_beta', "HR", "Lower_95CI_HR","Upper_95CI_HR", 
-            "p.value", 'predictor','outcome')
+            "p.value", 'pp_cov_Rsq','predictor','outcome')
   
   return(res)
 }

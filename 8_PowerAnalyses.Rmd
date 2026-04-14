@@ -1,0 +1,190 @@
+--
+title: "Plasma Proteomics Power Analyses"
+author: "Jonathan Chan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tictoc)
+library(pwr)
+library(readxl)
+rm(list=ls())
+
+theme_set(theme_classic(base_size=14))
+
+date <- as.POSIXlt(Sys.time(), 'UTC')
+date <- strftime(date, "%Y%m%dT%H:%M:%S%z")
+date <- str_match(date,'^(\\d+)T')[,2]
+```
+
+```{r}
+power <- 0.8
+n_predictors_cc <- 14+1 # This refers to the total number of predictors in the regression model
+```
+
+```{r}
+#I import in the actual results and compare their t statistics to this threshold ones
+ukb_cc_results <- read_tsv('OUTPUT/UKB/PLOTS/1_Case_vs_Control/2_Limma/2_5Y/HCM/rcmm_cov/allpanels/limma_results.tsv') %>%
+    arrange(P.Value) %>%
+    mutate(lambda_adjusted_pvalue = pchisq(qchisq(P.Value, df = 1, lower.tail = FALSE)/1.185,df=1,lower.tail=FALSE))
+
+aou_cc_results <- read_rds('OUTPUT/AOUS/DATA/hcm_all_vs_nonhcmhf_rcmmcov.rds')
+
+decode_cc_results <- read_excel('DATA/DeCODE_Genetics/results.hcm.somascan_iceland.case_control_analysis.20250924.xlsx') %>%
+    filter(str_detect(description, 'diagnosis before sampling')) %>%
+    mutate(adj_pval = p.adjust(pval_inv_normal_adj,method='BH')) %>%
+    mutate(fdr_sig = ifelse(adj_pval <= 0.05,T,F))%>%
+    filter(Target %in% c('N-terminal pro-BNP','Angiopoietin-2','Troponin I','Troponin T')) %>% 
+    #Mutate a t statistic column from p-value and beta
+    rowwise() %>%
+    mutate(t_statistic = sign(beta_inv_normal) * abs(qt(pval_inv_normal/2, df = n_total - n_predictors_cc - 1, lower.tail = FALSE))) %>%
+    ungroup() %>%
+    select(Target, n_total, n_cases, n_controls, beta_inv_normal, pval_inv_normal, adj_pval, fdr_sig, t_statistic)
+
+print(ukb_cc_results)
+print(aou_cc_results)
+print(decode_cc_results)
+```
+
+This details power analyses for statistical tests run in this analysis. These include
+
+1) Case-control association analyses (multivariable linear regression-based Wald tests of HCM disease status coefficient predictor != 0)
+2) Cox regression analyses for time-to-event outcomes of a) incident HCM diagnosis and b) clinical composite outcomes
+3) Cross-phenotype association analyses (linear regression)
+
+## Case-Control Association Analyses
+
+This uses `pwr.f2.test()` from the `pwr` package.
+
+```{r}
+#I run the power analysis using a fixed parameter of 80% power and the sample size as the one denoted in the case control association analysis in order to get out a threshold minimum effect size that can be detected.
+
+n_cc_ukb <- 42 + 49488
+n_cc_aou <- 546 + 41049
+n_cc_decode <- 51 + 38904
+
+#This defines the empirical p-value thresholds as the raw p-value of the least sig. signal after multiple testing correction which passed 5% qvalue threshold.
+sig_thresh_ukb <- max(7.52*10^-5, 0.05/2922) #Much more stringent due to much larger number of plasma proteins evaluated (corresponds to LTBP2 lambda-adjusted p-value)
+sig_thresh_aou <- 0.05/4 #Bonferroni-adjusted threshold set because MTC didn't remove any signals
+sig_thresh_decode <- max(0.0134, 0.05/4)
+
+threshold_effect_sizes_cc <- tibble(
+  cohort = c("UK Biobank", "All of Us", "deCODE"),
+  n = c(n_cc_ukb, n_cc_aou, n_cc_decode),
+  sig_thresh = c(sig_thresh_ukb, sig_thresh_aou, sig_thresh_decode)
+) |>
+  rowwise() |>
+  mutate(
+    f2 = pwr.f2.test(u = 1, v = n - n_predictors_cc - 1, f2 = NULL, sig.level = sig_thresh, power = power)$f2,
+    tstat = sqrt( f2 * (n - n_predictors_cc - 1))
+  )
+
+print(threshold_effect_sizes_cc)
+```
+
+## Cross-Phenotype Association Analyses
+
+This also uses the same `pwr.f2.test()` function given it is also a multivariable linear regression between CMR phenotype ~ covariates + plasma protein.
+
+```{r}
+hcmr_crosspheno_results <- read_tsv('OUTPUT/HCMR/crosspheno_assoc/all_vs_pp_marginal.tsv') %>%
+  filter(Predictor %in% c('NTproBNP','TnTStat')) %>%
+  mutate(p_adj = p.adjust(pval, method = 'BH')) %>%
+  mutate(fdr_sig = ifelse(p_adj <= 0.05,T,F)) %>%
+  mutate(t=Estimate/SE) %>%
+  arrange(abs(t))
+
+sig_thresh_crosspheno <- hcmr_crosspheno_results %>%
+  filter(fdr_sig == T) %>%
+  arrange(p_adj) %>%
+  slice_tail(n = 1) %>%
+  pull(p_adj)
+
+sig_thresh_crosspheno <- max(sig_thresh_crosspheno, 0.05/nrow(hcmr_crosspheno_results)) #Max of ether the empirical alpha or the Bonferroni-corrected threshold
+n_predictors_crosspheno <- 11+1 #11 covariates + 1 plasma protein predictor
+```
+
+```{r}
+threshold_effect_sizes_crosspheno <- tibble(
+  cohort = c("HCMR"),
+  n = 2476,
+  sig_thresh = sig_thresh_crosspheno
+) |>
+  rowwise() |>
+  mutate(
+    f2 = pwr.f2.test(u = 1, v = n - n_predictors_crosspheno - 1, f2 = NULL, sig.level = sig_thresh, power = power)$f2,
+    tstat = sqrt( f2 * (n - n_predictors_crosspheno - 1))
+  )
+
+print(threshold_effect_sizes_crosspheno)
+```
+
+## Cox Regression Analyses
+
+This leverages the work from Schoefeld 1983 and Hsieh and Lavori 2000. The function `cox_multivariable_power_threshold_effect_calculator()` calculates the minimum detectable effect size (in terms of log(Hazard Ratio) and Hazard Ratio) for a given number of events, power, alpha, R2, and variance of the predictor.
+
+```{r}
+cox_multivariable_power_threshold_effect_calculator <- function(d, alpha, R2, var_X, power=0.8) {
+  # Calculate the standard normal quantiles (Z-scores)
+  z_alpha <- qnorm(1 - alpha/2)
+  z_power <- qnorm(power)
+  
+  # Calculate the minimum detectable log(Hazard Ratio) using the Schoenfeld (1983) formula
+  log_HR_threshold <- (z_alpha + z_power) / sqrt(d * var_X * (1 - R2))
+  
+  # Convert log(HR) to the actual Hazard Ratio
+  HR_threshold <- exp(log_HR_threshold)
+  
+  print(paste("Minimum Detectable log(Hazard Ratio):", round(log_HR_threshold, 4)))
+  print(paste("Minimum Detectable Hazard Ratio (HR):", round(HR_threshold, 4)))
+  
+  return(list(log_HR_threshold = log_HR_threshold, HR_threshold = HR_threshold))
+}
+
+```
+
+```{r}
+ukb_incident_hcm_results <- read_rds('OUTPUT/UKB/PLOTS/5_CoxHCMDiag/2_5Y/rcmm_cov/allpanels/mvCox_results_ppranknorm.rds') %>%
+    arrange(p.value) %>%
+    mutate(lambda_adjusted_pvalue = pchisq(qchisq(p.value, df = 1, lower.tail = FALSE)/1.908,df=1,lower.tail=FALSE)) %>%
+    mutate(fdr_adj_pvalue = p.adjust(lambda_adjusted_pvalue, method = 'BH')) %>%
+    mutate(fdr_sig = ifelse(fdr_adj_pvalue <= 0.05,T,F))
+
+threshold_effect_sizes_cox_incidentHCM <- cox_multivariable_power_threshold_effect_calculator(
+  d = 58,          # Total number of incident HCM diagnoses
+  alpha = max(ukb_incident_hcm_results %>% filter(fdr_sig==T) %>% pull(lambda_adjusted_pvalue) %>% max(), 0.05/nrow(ukb_incident_hcm_results)),   # Empirical lambda-adjusted p-value for NTproBNP (the only signal that passed MTC in the actual analysis)
+  R2 = median(ukb_incident_hcm_results$pp_cov_Rsq),       # Variance of the protein explained by other covariates
+  var_X = 1       # Variance of the protein is 1 if rank-inverse normalized
+)
+```
+
+This runs the power analysis for Cox regression against incident outcomes in UKB.
+
+```{r}
+ukb_composite_outcome_results <- read_tsv('OUTPUT/UKB/PLOTS/4_SURVIVAL/2_COXPH/3_TOTAL/rcmm_cov/multivariable_cox_results.tsv') %>%
+    arrange(p.value) %>%
+    mutate(fdr_adj_pvalue = p.adjust(p.value, method = 'BH')) %>%
+    mutate(fdr_sig = ifelse(fdr_adj_pvalue <= 0.05,T,F)) %>%
+    mutate(n_events = case_when(
+      outcome=='HF' ~ 33,
+      outcome == 'VA' ~ 15,
+      outcome=='OVERALL' ~53
+    )) 
+
+composite_pval_threshold <- max(ukb_composite_outcome_results %>% filter(fdr_sig==T) %>% pull(p.value) %>% max(), 0.05/nrow(ukb_composite_outcome_results))
+
+ukb_composite_outcome_results  <- ukb_composite_outcome_results %>%
+    group_by(outcome) %>%
+    mutate(threshold_HR = cox_multivariable_power_threshold_effect_calculator(
+      d = n_events,          # Total number of events for the outcome
+      alpha = composite_pval_threshold,    # Empirical p-value threshold for the significant signals for that outcome
+      R2 = median(pp_cov_Rsq),       # Variance of the protein explained by other covariates
+      var_X = 1       # Variance of the protein is 1 if rank-inverse normalized
+    )$HR_threshold)
+
+
+```

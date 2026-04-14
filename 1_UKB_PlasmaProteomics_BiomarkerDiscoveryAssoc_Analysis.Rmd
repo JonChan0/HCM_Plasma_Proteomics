@@ -1238,8 +1238,6 @@ hcm_tb2 <- readRDS('DATA/UKB/PROCESSED/3_TOTAL/ukb_diagnosis_dates_minimum.rds')
 ukb_outcomes <- read_tsv('../../HCM_Severity/DATASETS/UKB/RAP/Outcomes/Processed/allukb_outcome_ages.tsv')
 ```
 
-
-
 ```{r}
 ukb_diag_cox_tb <- ukb_pp %>%
   left_join(select(ukb_outcomes,ID, lost_age, death_age, age_attend_i0, dob_approx), by=c('eid'='ID')) %>%
@@ -1264,7 +1262,7 @@ quantile(ukb_diag_cox_tb$followup_time, 0.25)
 quantile(ukb_diag_cox_tb$followup_time, 0.75)
 ```
 
-## multivariable Cox
+## Multivariable Cox
 
 This runs Cox regression with the covariates of interest, running marginal models over all the pp.
 
@@ -1273,6 +1271,15 @@ multivariable_cox <- function(input_tb, marginal_predictor, covariates, status, 
   
   print(str_glue('Running multivariable Cox regression for {marginal_predictor}'))
 
+  #First I run a linear regression between covariates and marginal predictor to estimate the R-squared for this protein (i.e. variance inflation factor)
+  # 1. Construct the formula: Protein ~ Covariate1 + Covariate2 + ...
+  x <- str_c(covariates, collapse='+')
+  formula_str <- paste(marginal_predictor, '~', x)
+  formula <- as.formula(formula_str)
+  lm_model <- lm(formula, data = input_tb, na.action=na.omit)
+  pp_cov_r_squared <- summary(lm_model)$r.squared
+
+  #Run the Cox regression itself
   x <- str_c(c(covariates,marginal_predictor), collapse='+')
   y <- str_c('Surv(',outcome_var,',',status,')')
   formula <- as.formula(paste(y,'~',x))
@@ -1310,14 +1317,14 @@ multivariable_cox <- function(input_tb, marginal_predictor, covariates, status, 
     vars <- rownames(x$coef)[nrow(x$coef)]
   }
   
-  res<-bind_cols(vars,beta, se_beta, HR, HR.confint.lower, HR.confint.upper, p.value, z.value) %>%
+  res<-bind_cols(vars,beta, se_beta, HR, HR.confint.lower, HR.confint.upper, p.value, z.value,pp_cov_r_squared) %>%
     mutate(predictor=str_to_upper(vars)) %>%
     mutate(outcome = factor(
       str_to_upper(str_match(outcome_var,'(.+)_age')[,2]),levels=outcome_levels, ordered=T
     ))
   
   names(res)<-c('var',"beta",'se_beta', "HR", "Lower_95CI_HR","Upper_95CI_HR", 
-            "p.value", 'z.value','predictor','outcome')
+            "p.value", 'z.value', 'pp_cov_Rsq','predictor','outcome')
   
   return(res)
 }

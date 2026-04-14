@@ -20,7 +20,7 @@ theme_set(
   ) 
 ```
 
-This notebook looks at cross-trait associations within HCMR, evaluating them using multivariate linear regression of both joint and marginal models to correct for confounders such as age;sex; BMI and BSA (where necessary).
+This notebook looks at cross-trait associations within HCMR, evaluating them using multivariable linear regression of both joint and marginal models to correct for confounders such as age;sex; BMI and BSA (where necessary).
 
 # Import
 
@@ -61,6 +61,7 @@ filtered_tb <- filtered_tb %>%
 
 print(str_c(nrow(filtered_tb), ' HCMR patients are analysed with non-NA values in age; gender; BMI and common genetic PCs'))
 ```
+
 # Normalisation
 
 For ease of comparison, I will transform all the biomarkers using inverse-rank based transformation.
@@ -302,21 +303,21 @@ hcmr_summary_output <- generate_summary_table_R(summary_tb, 'OUTPUT/HCMR/hcmr_su
                          median_iqr_vars = c('age','bmi',c('wallthkmax',hty,func,fibr)))
 ```
 
-# Multivariate Regression Analysis
+# Multivariable Regression Analysis
 
-This performs multivariate linear regression (for continuous phenotypes) against the phenotype of interest + covariates of age/sex/BMI/BSA (if non-indexed).
+This performs multivariable linear regression (for continuous phenotypes) against the phenotype of interest + covariates of age/sex/BMI/BSA (if non-indexed).
 You have to be careful about linear regression assumptions as well so some traits e.g LGE and the biomarkers need to be normalised.
 
-The assumptions of multivariate linear regression include:
+The assumptions of multivariable linear regression include:
 
 - Lack of multicollinearity (addressed by assessing VIF)
-- Multivariate normality i.e residuals normally distributed (addressed by evaluating QQplots of residuals)
+- Multivariable normality i.e residuals normally distributed (addressed by evaluating QQplots of residuals)
 - Homoscedasticity of residuals (addressed by evaluating scale-location plot: flat horizontal line with equally spread points expected)
 - Linearity (addressed by evaluating scatterplot of residuals vs. predicted values: flat horizontal line expected)
 
-```{r multivariate_assessor_function}
+```{r multivariable_assessor_function}
 
-multivariate_assessor <- function(input_tb, response_var, predictor_vars, covars=c('age','gender','bmi','cmrdiabp','pc1','pc2','pc3','pc4','pc5', 'sarcomere'),cont_or_discrete_response='cont', model_return=F, summary_print=T, ivnormalise=F){ #Assume already rank-based inverse normalised
+multivariable_assessor <- function(input_tb, response_var, predictor_vars, covars=c('age','gender','bmi','cmrdiabp','pc1','pc2','pc3','pc4','pc5', 'sarcomere'),cont_or_discrete_response='cont', model_return=F, summary_print=T, ivnormalise=F){ #Assume already rank-based inverse normalised
   
   formula <- str_c(response_var, '~',
                    str_c(covars, collapse='+'),'+',
@@ -458,23 +459,23 @@ This evaluates in a joint model (i.e all together).
 ```{r g1_comp_vs_pp}
 # #Fibrosis ~ plasma proteins
 # print('Evaluating fibrosis ~ plasma')
-# fibr_vs_pp <- map(fibr,~multivariate_assessor(transformed_tb,.x,pp))%>% bind_rows()
+# fibr_vs_pp <- map(fibr,~multivariable_assessor(transformed_tb,.x,pp))%>% bind_rows()
 # 
 # #Evaluate separately for LGE_pres due to discrete nature
-# lge_pres_vs_pp <- multivariate_assessor(transformed_tb, 'lge_pres',pp,cont_or_discrete_response = 'discrete')
+# lge_pres_vs_pp <- multivariable_assessor(transformed_tb, 'lge_pres',pp,cont_or_discrete_response = 'discrete')
 # fibr_vs_pp <- bind_rows(fibr_vs_pp, lge_pres_vs_pp)
 # rm(lge_pres_vs_pp)
 # 
 # #Functional ~ plasma proteins
 # print('Evaluating functional ~ plasma')
-# func_vs_pp <- map(func,~multivariate_assessor(transformed_tb,.x,pp))%>% bind_rows()
+# func_vs_pp <- map(func,~multivariable_assessor(transformed_tb,.x,pp))%>% bind_rows()
 # 
 # #Hypertrophy ~ plasma proteins
 # print('Evaluating hypertrophy ~ plasma')
-# hty_vs_pp <- map(hty,~multivariate_assessor(transformed_tb,.x,pp))%>% bind_rows()
+# hty_vs_pp <- map(hty,~multivariable_assessor(transformed_tb,.x,pp))%>% bind_rows()
 # 
 # #Evaluate separately for wallthkmax due to need for BSA covariate
-# wallthkmax_vs_pp <- multivariate_assessor(transformed_tb, 'wallthkmax',pp,covars=c('age','gender','bmi','bsa','pc1','pc2','pc3','pc4','pc5'))
+# wallthkmax_vs_pp <- multivariable_assessor(transformed_tb, 'wallthkmax',pp,covars=c('age','gender','bmi','bsa','pc1','pc2','pc3','pc4','pc5'))
 # hty_vs_pp <- bind_rows(hty_vs_pp, wallthkmax_vs_pp)
 # rm(wallthkmax_vs_pp)
 # 
@@ -501,28 +502,28 @@ I also analyse each plasma protein individually via marginal models (hence CMR m
 #Fibrosis ~ plasma proteins
 print('Evaluating fibrosis ~ plasma marginally')
 fibr_vs_pp_combinations <- as.list(expand_grid(fibr,pp))
-fibr_vs_pp_marginal <- map2(fibr_vs_pp_combinations[[1]],fibr_vs_pp_combinations[[2]],~multivariate_assessor(transformed_tb,.x,.y))%>% bind_rows()
+fibr_vs_pp_marginal <- map2(fibr_vs_pp_combinations[[1]],fibr_vs_pp_combinations[[2]],~multivariable_assessor(transformed_tb,.x,.y))%>% bind_rows()
 rm(fibr_vs_pp_combinations)
 
 #Evaluate separately for LGE_pres due to discrete nature
 # lge_pres_vs_pp_combinations <- as.list(expand_grid('lge_pres',pp))
-# lge_pres_vs_pp_marginal <- map2(lge_pres_vs_pp_combinations[[1]],lge_pres_vs_pp_combinations[[2]],~multivariate_assessor(transformed_tb,.x,.y,cont_or_discrete_response = 'discrete'))%>% bind_rows()
+# lge_pres_vs_pp_marginal <- map2(lge_pres_vs_pp_combinations[[1]],lge_pres_vs_pp_combinations[[2]],~multivariable_assessor(transformed_tb,.x,.y,cont_or_discrete_response = 'discrete'))%>% bind_rows()
 # fibr_vs_pp_marginal <- bind_rows(fibr_vs_pp_marginal, lge_pres_vs_pp_marginal)
 # rm(lge_pres_vs_pp_marginal)
 
 #Functional ~ plasma proteins
 print('Evaluating functional ~ plasma marginally')
 func_vs_pp_combinations <- as.list(expand_grid(func,pp))
-func_vs_pp_marginal <- map2(func_vs_pp_combinations[[1]],func_vs_pp_combinations[[2]],~multivariate_assessor(transformed_tb,.x,.y))%>% bind_rows()
+func_vs_pp_marginal <- map2(func_vs_pp_combinations[[1]],func_vs_pp_combinations[[2]],~multivariable_assessor(transformed_tb,.x,.y))%>% bind_rows()
 
 #Hypertrophy ~ plasma proteins
 print('Evaluating hypertrophy ~ plasma marginally')
 hty_vs_pp_combinations <- as.list(expand_grid(hty,pp))
-hty_vs_pp_marginal <- map2(hty_vs_pp_combinations[[1]],hty_vs_pp_combinations[[2]],~multivariate_assessor(transformed_tb,.x,.y))%>% bind_rows()
+hty_vs_pp_marginal <- map2(hty_vs_pp_combinations[[1]],hty_vs_pp_combinations[[2]],~multivariable_assessor(transformed_tb,.x,.y))%>% bind_rows()
 
 #Evaluate separately for wallthkmax due to need for BSA covariate
 wallthkmax_vs_pp_combinations <- as.list(expand_grid('wallthkmax',pp))
-wallthkmax_vs_pp_marginal <- map2(wallthkmax_vs_pp_combinations[[1]],wallthkmax_vs_pp_combinations[[2]],~multivariate_assessor(transformed_tb,.x,.y,covars=c('age','gender','bmi','cmrdiabp','pc1','pc2','pc3','pc4','pc5', 'sarcomere', 'bsa')))%>% bind_rows()
+wallthkmax_vs_pp_marginal <- map2(wallthkmax_vs_pp_combinations[[1]],wallthkmax_vs_pp_combinations[[2]],~multivariable_assessor(transformed_tb,.x,.y,covars=c('age','gender','bmi','cmrdiabp','pc1','pc2','pc3','pc4','pc5', 'sarcomere', 'bsa')))%>% bind_rows()
 hty_vs_pp_marginal <- bind_rows(hty_vs_pp_marginal, wallthkmax_vs_pp_marginal)
 rm(wallthkmax_vs_pp_marginal)
 
@@ -765,10 +766,10 @@ This evaluates sarcomere +ve individuals to assess correlations between DBP and 
 df <- transformed_tb %>%
   filter(sarcomere==T)
 
-func_vs_dbp_marginal <- map(func,~multivariate_assessor(filtered_tb,.x,'cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5')))%>% bind_rows()
-hty_vs_dbp_marginal <- map(hty,~multivariate_assessor(filtered_tb,.x,'cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5')))%>% bind_rows()
-fibr_vs_dbp_marginal <- map(fibr,~multivariate_assessor(filtered_tb,.x,'cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5')))%>% bind_rows()
-maxlvwt_vs_dbp_marginal <- multivariate_assessor(df, 'wallthkmax','cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5','bsa'))
+func_vs_dbp_marginal <- map(func,~multivariable_assessor(filtered_tb,.x,'cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5')))%>% bind_rows()
+hty_vs_dbp_marginal <- map(hty,~multivariable_assessor(filtered_tb,.x,'cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5')))%>% bind_rows()
+fibr_vs_dbp_marginal <- map(fibr,~multivariable_assessor(filtered_tb,.x,'cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5')))%>% bind_rows()
+maxlvwt_vs_dbp_marginal <- multivariable_assessor(df, 'wallthkmax','cmrdiabp', covars=c('age','gender','bmi','pc1','pc2','pc3','pc4','pc5','bsa'))
 
 all_vs_dbp_marginal <- bind_rows(fibr_vs_dbp_marginal, func_vs_dbp_marginal, hty_vs_dbp_marginal, maxlvwt_vs_dbp_marginal) %>%
   left_join(select(label_tb,Variable,Label), by=c('Pheno'='Variable')) %>%
