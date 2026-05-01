@@ -554,7 +554,7 @@ pp <- ukb_pp_list$ukb_fieldname_equivalent[ukb_pp_list$ukb_fieldname_equivalent 
 This provides a boxplot function to look at the most significanat ones.
 
 ```{r}
-box_plotter <- function(input_tb, pheno, output_path='output/2_CrossPheno_AssocAnalysis/ukb/EDA/case_vs_controls/', grouping_var='hcm', xunits='NPX'){
+box_plotter <- function(input_tb, pheno, output_path, grouping_var='hcm', xunits='NPX'){
   
   boxplot <- ggplot(input_tb, aes(y=eval(parse(text=pheno)), x=eval(parse(text=grouping_var))))+
     geom_signif(comparisons=list(c('TRUE','FALSE')), test='t.test')+
@@ -792,6 +792,14 @@ pp_vs_hcm_marginal_fdr5_summarytb_limma <- summary_plotter_limma(limma_hcm, 'all
 pp_vs_hcm_marginal_fdr1_summarytb_limma <- summary_plotter_limma(limma_hcm, 'allpp_vs_hcm_fdr1',predictor = 'HCM status',output_path=path, pval = 'fdr', fdr_threshold=0.01) 
 
 rm(ukb_pp_hcm_cov, path)
+```
+
+This is mini post-publication test for ANGPT2/ANGPT1 ratio as per Yingjie.
+
+```{r}
+test <- mutate(ukb_pp_hcm_cov,angpt2_1_ratio = angpt2/angpt1) %>% 
+  mutate(ifelse(is.infinite(angpt2_1_ratio),NA,angpt2_1_ratio))
+angpt2_1_check <- map(c('angpt2','angpt1','angpt2_1_ratio','ntprobnp'), ~limma_dpe(test, ., covar=covars)) %>% bind_rows()
 ```
 
 ### Sensitivity Analysis: Non-HF HCM Case-Control
