@@ -1,5 +1,7 @@
 # Biobank-Scale Plasma Proteomics Identifies Novel Biomarkers in Hypertrophic Cardiomyopathy
 
+**Now published in Circulation: Precision and Genomic Medicine: https://www.ahajournals.org/doi/10.1161/CIRCGEN.125.005325**
+
 **Jonathan H Chan<sup>a,b</sup>, Christopher Grace<sup>a,b</sup>, Mohsen Mazidi<sup>c</sup>, Robert Clarke<sup>c</sup>, Carolyn Y. Ho<sup>d</sup>, Stefan Neubauer<sup>a</sup>, Christopher M. Kramer<sup>e</sup> on behalf of HCMR Investigators, Hugh Watkins<sup>a,b</sup>, Anuj Goel<sup>a,b</sup>**
 
 ---
