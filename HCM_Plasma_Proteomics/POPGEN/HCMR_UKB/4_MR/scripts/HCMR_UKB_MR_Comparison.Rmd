@@ -1,0 +1,42 @@
+---
+title: "HCMR_UKB_MR_Comparison"
+author: "Jonathan Chan"
+date: "2025-04-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggrepel)
+rm(list=ls())
+```
+
+
+## Comparison Plot of HCMR vs. UKB GWAS Single-Instrument MR Results
+```{r}
+pp <- 'ntprobnp'
+
+ukb_mr <- read_tsv(str_c('../output/ukb_noHarper_inclHCM/hcm_to_',pp,'/hcm_to_',pp,'_instrument_details.tsv')) %>% dplyr::rename('beta.outcome.ukb'='beta.outcome','se.outcome.ukb'='se.outcome') %>% select(SNP, beta.outcome.ukb, se.outcome.ukb)
+hcmr_mr <- read_tsv(str_c('../output/hcmr/hcm_to_',pp,'//hcm_to_',pp,'_instrument_details.tsv')) %>% dplyr::rename('beta.outcome.hcmr'='beta.outcome','se.outcome.hcmr'='se.outcome') %>% select(SNP, beta.outcome.hcmr, se.outcome.hcmr)
+```
+
+```{r}
+shared_instruments <- ukb_mr$SNP[ukb_mr$SNP %in% hcmr_mr$SNP]
+
+plot_tb <- left_join(ukb_mr, hcmr_mr) %>%
+  filter(SNP %in% shared_instruments)
+rm(ukb_mr, hcmr_mr)
+
+comp_plot <- ggplot(plot_tb, aes(x=beta.outcome.ukb, y=beta.outcome.hcmr))+
+  geom_pointrange(aes(xmin=beta.outcome.ukb-se.outcome.ukb, xmax = beta.outcome.ukb+se.outcome.ukb,
+                    ymin = beta.outcome.hcmr - se.outcome.hcmr, ymax = beta.outcome.hcmr+se.outcome.hcmr))+
+  geom_abline(slope=1, intercept=0, linetype='dashed', col='red')+
+  xlab('SNP Effect on NTproBNP in UKB GWAS')+
+  ylab('SNP Effect on NTproBNP in HCMR GWAS')+
+  labs(caption='Error bars reflect standard error')
+
+print(comp_plot)
+ggsave(str_c(results_folder, 'hcm_to_ntprobnp_ukb_hcmr_betacomp.png'), dpi=600)
+```
+

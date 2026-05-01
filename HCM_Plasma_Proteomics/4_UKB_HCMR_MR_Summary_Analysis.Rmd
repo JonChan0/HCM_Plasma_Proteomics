@@ -1,0 +1,341 @@
+---
+title: "UKB_HCMR_MR_SummaryAnalysis"
+author: "Jonathan Chan"
+date: "2025-03-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggrepel)
+rm(list=ls())
+theme_set(theme_classic(base_size=14))
+```
+
+This provides summary plot of the results from bidirectional MR from HCM <-> plasma protein.
+The plasma proteins passed in are those which pass MTC threshold in UKB either case-control association analysis OR incident diagnosis analysis.
+
+```{r config}
+ukb_mr_folder <- '../../EDA_HCMR/popgen/5_MR/output/ukb_noHarper_inclHCM/'
+hcmr_mr_folder <- '../../EDA_HCMR/popgen/5_MR/output/hcmr/'
+results_folder <- 'OUTPUT/UKB/PLOTS/6_MR_Summary/'
+```
+
+
+```{r pp_of_choice}
+ukb_pps <- c(
+  'NTproBNP','NPPB','TNNI3','ANGPT2','LTBP2'
+) #5 plasma proteins but TNNI3 doesn't have an instrument so expected analyses = 5 x 2 + 1 =11
+hcmr_pps <- c('NTproBNP','TnTStat') #2 analyses expected
+
+```
+
+```{r import}
+ukb_analyses <- list.dirs(ukb_mr_folder, recursive=F, full.names=F)
+ukb_analyses <- ukb_analyses[str_detect(ukb_analyses, str_c(ukb_pps, collapse='|'))]
+
+hcmr_analyses <- list.dirs(hcmr_mr_folder, recursive=F, full.names=F)
+hcmr_analyses <- hcmr_analyses[str_detect(hcmr_analyses, str_c(hcmr_pps, collapse='|'))]
+
+mainline_results_importer <- function(folder){
+  mainline_results <- read.table(str_c(folder, '/',str_match(folder,'\\/([^\\/]+)_to_')[,2], '_mr_results_mainline.tsv')) %>%
+    select(-id.exposure, -id.outcome) %>%
+    mutate(exposure=ifelse(exposure=='TnTStat', 'TNNT2', exposure),
+           outcome=ifelse(outcome=='TnTStat','TNNT2',outcome)) %>%
+    mutate(exposure = ifelse(exposure == 'hcm', 'HCM', exposure),
+           outcome= ifelse(outcome=='hcm','HCM', outcome)) %>%
+    mutate(exposure_outcome = str_c(exposure, outcome, sep=' -> '))
+  
+  return(mainline_results)
+}
+
+ukb_results <- map(str_c(ukb_mr_folder, ukb_analyses), ~mainline_results_importer(.)) %>% bind_rows() %>% mutate(dataset='UKB')
+hcmr_results <- map(str_c(hcmr_mr_folder, hcmr_analyses), ~mainline_results_importer(.)) %>% bind_rows() %>% mutate(dataset='HCMR')
+mr_results <- bind_rows(ukb_results, hcmr_results)
+
+write_tsv(mr_results, str_c(results_folder, 'summary_MR_results.tsv'))
+rm(ukb_results, hcmr_results)
+
+```
+
+
+```{r}
+sensitivity_or_results_importer <- function(folder){
+  mainline_results <- read.table(str_c(folder, '/',str_match(folder,'\\/([^\\/]+)_to_')[,2], '_mr_results_sensitivity_oddsratio.tsv'))
+  
+  if('V1' %in% colnames(mainline_results)){
+    print(str_c('No confidence interval estimates due to single-SNP MR for', folder))
+    return()
+  } else{
+    mainline_results <- mainline_results %>% select(-id.exposure, -id.outcome)%>%
+    mutate(exposure=ifelse(exposure=='TnTStat', 'TNNT2', exposure),
+           outcome=ifelse(outcome=='TnTStat','TNNT2',outcome)) %>%
+    mutate(exposure = ifelse(exposure == 'hcm', 'HCM', exposure),
+           outcome= ifelse(outcome=='hcm','HCM', outcome)) %>%
+    mutate(exposure_outcome = str_c(exposure, outcome, sep=' -> '))
+    
+      return(mainline_results)
+  }
+}
+
+ukb_results_or <- map(str_c(ukb_mr_folder, ukb_analyses), ~sensitivity_or_results_importer(.)) %>% bind_rows() %>% mutate(dataset='UKB')
+hcmr_results_or <- map(str_c(hcmr_mr_folder, hcmr_analyses), ~sensitivity_or_results_importer(.)) %>% bind_rows() %>% mutate(dataset='HCMR') 
+
+mr_results_or <- bind_rows(ukb_results_or, hcmr_results_or) %>% filter(method %in% c('Inverse variance weighted', 'Wald ratio')) 
+
+#Add back the mr_results for the Wald ratio based rows (which don't have odds ratios)
+mr_results_or <- bind_rows(mr_results_or, filter(mr_results, method=='Wald ratio') %>% mutate(lo_ci = b - qnorm(0.975) * se, up_ci = b+qnorm(0.975) * se))
+
+write_tsv(mr_results_or, str_c(results_folder, 'summary_MR_results_oddsratio.tsv'))
+rm(hcmr_results_or, ukb_results_or)
+```
+
+Correct for multiple testing 
+
+```{r}
+mr_results_or <- mr_results_or %>%
+  mutate(mtc_pval = p.adjust(pval, method='fdr')) %>%
+  mutate(label = ifelse(mtc_pval <= 0.05, exposure_outcome, '')) %>%
+  mutate(group = ifelse(exposure=='HCM', 'HCM -> X', 'X -> HCM'))
+```
+
+## Summary Plot
+
+```{r}
+#Output the summary scatter plot of pvalue with effect size
+summary_scatter_confint <- ggplot(mr_results_or,aes(x=b,y=-log10(mtc_pval))) +
+  geom_point(aes(shape=group, col=dataset))+
+  geom_errorbar(aes(xmin=lo_ci, xmax=up_ci, col=dataset))+
+  geom_vline(xintercept=0, linetype='dashed', col='black')+
+  geom_hline(yintercept=-log10(0.05), linetype='dashed', col='black')+
+  geom_text_repel(aes(label=label, col=dataset), size=5)+
+  xlab('Beta (Increase in Outcome per Log(Odds) or SD Increase in Exposure)')+
+  ylab('-log10 (Adjusted p-value)')+
+  labs(shape='Direction', col='Dataset')+
+  labs(title=str_wrap(str_c('Summary plot of 2-sample Mendelian Randomisation for ', nrow(mr_results_or), ' analyses'))
+       ,caption='Error bars = 95% confidence interval'
+       )+
+  theme(axis.title = element_text(size=14), axis.text =element_text(size=12))
+
+print(summary_scatter_confint)
+ggsave(str_c(results_folder, 'MR_summary_plot_confint.png'),summary_scatter_confint, dpi=600, width=9, height=6)
+```
+
+## Forest Plot for Significant Conclusions
+
+```{r}
+sig_mr_results_or <- mr_results_or %>%
+  filter(label !='')
+
+sig_mr_results_or <- sig_mr_results_or %>%
+    mutate(exposure_plot_group = case_when(
+                                         exposure == 'HCM' ~ 'Per-Log(Odds) Exposure',
+                                         T~'Per-Unit Exposure'))
+
+
+sig_mr_results_or <- sig_mr_results_or %>%
+  mutate(outcome_plot_group = ifelse(outcome %in% c('HCM'), 'OR', 'beta')) %>%
+  mutate(exposure_outcome=factor(exposure_outcome)) %>%
+  mutate(transformed_b = b*log(2)) #This transforms the causal estimate to increase in outcome per doubling of genetically predicted liability
+
+forest_plot1 <- ggplot(sig_mr_results_or)+
+  geom_point(aes(x=transformed_b, y= exposure_outcome, col=dataset))+
+  geom_errorbar(aes(xmin=lo_ci * log(2), xmax=up_ci * log(2), y=exposure_outcome,col=dataset))+
+  geom_vline(xintercept=0, col='black', linetype='dashed')+
+  xlab('Change in Continuous Outcome (SD) per Doubling of Genetic Liability to HCM')+
+  ylab('Exposure -> Outcome')+
+  labs(col='Dataset')+
+  theme(axis.title = element_text(size=14), axis.text =element_text(size=12))
+
+print(forest_plot1)
+ggsave(str_c(results_folder,'sig_MR_forestplot.png'),forest_plot1, dpi=600, width=9, height=3)
+ggsave(str_c(results_folder,'sig_MR_forestplot_poster.png'),forest_plot1, dpi=600, width=6, height=6)
+```
+
+## Instruments Supplementary Table
+
+This provides a supplementary table detailing the instruments used in the UKB and HCMR MR analyses between HCM <-> plasma proteins of interest.
+
+This involves extracting data from the `instrument_details.tsv` files that each MR analysis prints out.
+However, the N number is missing from these files so they are queried in the original GWAS summstats for each instrumental variable.
+
+```{r, echo=FALSE}
+
+ukb_folder <- '../../hcmr_ukbb/popgen/5_MR/output/ukb_noHarper_inclHCM/'
+hcmr_folder <- '../../hcmr_ukbb/popgen/5_MR/output/hcmr/'
+
+hcmr_instrument_tsvs <- list.files(hcmr_folder,pattern='.tsv', full.names=T)
+ukb_instrument_tsvs <- list.files(ukb_folder,pattern='.tsv', full.names=T)
+
+#Filter to only those traits which are analysed i.e ukb_pps and hcmr_pps
+hcmr_instrument_tsvs <- hcmr_instrument_tsvs[str_detect(hcmr_instrument_tsvs, str_c(hcmr_pps, collapse='|'))]
+ukb_instrument_tsvs <- ukb_instrument_tsvs[str_detect(ukb_instrument_tsvs, str_c(ukb_pps, collapse='|'))]
+
+#Filter each so that it only takes the hcm_to_NTproBNP_instrument_details instead of hcm_to_X every single time
+hcmr_instrument_tsvs <- c(hcmr_instrument_tsvs[!str_detect(hcmr_instrument_tsvs,'hcm_to_')], "../../hcmr_ukbb/popgen/5_MR/output/hcmr//hcm_to_NTproBNP_instrument_details.tsv")
+ukb_instrument_tsvs <- c(ukb_instrument_tsvs[!str_detect(ukb_instrument_tsvs,'hcm_to_')], "../../hcmr_ukbb/popgen/5_MR/output/ukb_noHarper_inclHCM//hcm_to_NTproBNP_instrument_details.tsv")
+
+```
+
+```{r}
+# --- Function to Process a Single Instrument TSV File ---
+process_instrument_file <- function(input_tsv_path, gwas_file_path='guess') {
+  
+  # Extract exposure name from the input file path
+  exposure_name <- str_match(input_tsv_path,"(?:.*/|^)([^/]+)_to_.*")[,2]
+  message(paste("Processing exposure:", exposure_name, "from file:", input_tsv_path))
+  
+  #This guesses the gwas summary statistic filepath based on the exposure_name and the input_tsv_path
+  if (gwas_file_path=='guess'){ 
+    if(str_detect(input_tsv_path, 'ukb_noHarper_inclHCM')) { #i.e if the exposure GWAS is from UKB
+      basedir <- '/well/PROCARDIS/jchan/hcmr_ukbb/popgen/2_gwas/output/gwas/ukb/REGENIE/step2/2_inclHCMcases/formatted/'
+        
+        if(exposure_name=='hcm'){gwas_file_path <- '/well/PROCARDIS/jchan/hcmr_ukbb/popgen/5_MR/input/gwas_summary_statistics/HCM/hcm_meta.230523.fix.gwama.noukb_filtered.tsv'}
+      else{
+        gwas_file_path <- str_c(basedir,exposure_name, '_manhattan_rsid_logpval.tsv')
+      }
+    
+    } else if (str_detect(input_tsv_path, 'hcmr')){ #i.e if the exposure GWAS is from HCMR
+        basedir <- '/well/PROCARDIS/jchan/hcmr_ukbb/popgen/2_gwas/output/gwas/hcmr/REGENIE/step2/formatted/'
+        
+      if (exposure_name =='hcm'){gwas_file_path <- '/well/PROCARDIS/jchan/hcmr_ukbb/popgen/5_MR/input/gwas_summary_statistics/HCM/hcm_meta.230523.fix.gwama.nohcmr_filtered.tsv'}
+    else{
+          gwas_file_path <- str_c(basedir,exposure_name, '_manhattan_rsid2_logpval.tsv')
+    } 
+
+    } 
+  }
+    
+  
+  # Read the instrument .tsv file
+  tryCatch({
+    instrument_data <- data.table::fread(input_tsv_path, header = TRUE)
+  }, error = function(e) {
+    stop(paste("Error reading instrument file:", input_tsv_path, "-", e$message))
+  })
+  
+  # Select and rename columns for the summary table
+  # Ensure the column names in your .tsv match these exactly
+  required_cols_instrument <- c("SNP", "effect_allele.exposure", "other_allele.exposure",'eaf.exposure',
+                                "beta.exposure", "se.exposure","pval.exposure")
+  if (!all(required_cols_instrument %in% names(instrument_data))) {
+    stop(paste("Missing one or more required columns in", input_tsv_path,
+               ". Required columns are:", paste(required_cols_instrument, collapse=", "),
+               ". Available columns are:", paste(names(instrument_data), collapse=", ")))
+  }
+  
+  summary_subset <- instrument_data[, ..required_cols_instrument]
+  data.table::setnames(summary_subset,
+           old = c("SNP", "effect_allele.exposure", "other_allele.exposure","eaf.exposure", "beta.exposure", "se.exposure","pval.exposure"),
+           new = c("rsID", "EA", "NEA", 'EAF',"Beta", "SE","pval"))
+           
+  # Get the path to the corresponding GWAS summary statistics file
+  message(paste("Attempting to read GWAS summary statistics from:", gwas_file_path))
+  
+  # Read the GWAS summary statistics file
+  # We only need rsid and all_total (N)
+  # Using fread's select argument for efficiency
+  tryCatch({
+    # First, try to get headers to confirm 'rsid' and 'all_total' exist
+    gwas_headers <- names(data.table::fread(gwas_file_path, nrows = 0))
+    required_gwas_cols <- c("rsid", "all_total") # Adjust if your GWAS N column is named differently
+
+    # Check if 'rsid' is present, if not, try 'SNP' or other common variants
+    if (!"rsid" %in% gwas_headers) {
+        if ("SNP" %in% gwas_headers) {
+            required_gwas_cols[required_gwas_cols == "rsid"] <- "SNP"
+            message("Found 'SNP' column in GWAS file, using it as rsID.")
+        } else if ("variant_id" %in% gwas_headers) {
+             required_gwas_cols[required_gwas_cols == "rsid"] <- "variant_id"
+             message("Found 'variant_id' column in GWAS file, using it as rsID.")
+        } else {
+            stop(paste("Column 'rsid' (or 'SNP'/'variant_id') not found in GWAS file:", gwas_file_path,
+                       ". Available columns:", paste(gwas_headers, collapse=", ")))
+        }
+    }
+    # Check for N column
+    if (!"all_total" %in% gwas_headers) {
+        # Add other common N column names here if needed
+        common_N_cols <- c("N", "n", "SAMPLE_SIZE", "sample_size","n_samples")
+        found_N_col <- FALSE
+        for(col_name in common_N_cols){
+            if(col_name %in% gwas_headers){
+                required_gwas_cols[required_gwas_cols == "all_total"] <- col_name
+                message(paste0("Found '", col_name, "' column in GWAS file, using it as N."))
+                found_N_col <- TRUE
+                break
+            }
+        }
+        if(!found_N_col){
+          stop(paste("Column 'all_total' (or other common N column names) not found in GWAS file:", gwas_file_path,
+                     ". Available columns:", paste(gwas_headers, collapse=", ")))
+        }
+    }
+
+    gwas_data <- data.table::fread(gwas_file_path, select = required_gwas_cols)
+    
+    # Rename GWAS columns for merging (if they were changed)
+    current_rsid_col_gwas <- required_gwas_cols[1] # This will be 'rsid', 'SNP', or 'variant_id'
+    current_N_col_gwas <- required_gwas_cols[2]   # This will be 'all_total' or another N column
+    
+    data.table::setnames(gwas_data, old = c(current_rsid_col_gwas, current_N_col_gwas), new = c("rsID_gwas", "N"))
+
+  }, error = function(e) {
+    stop(paste("Error reading or processing GWAS summary statistics file:", gwas_file_path, "-", e$message))
+  })
+  
+  # Merge to add N column
+  # Ensure rsID columns are of the same type if issues arise i.e character
+  summary_subset[, rsID := as.character(rsID)]
+  gwas_data[, rsID_gwas := as.character(rsID_gwas)]
+  
+  gwas_data_filtered <- gwas_data %>%
+    filter(rsID_gwas %in% unique(summary_subset$rsID))
+  
+  merged_data <- merge(summary_subset, gwas_data_filtered,
+                       by.x = "rsID", by.y = "rsID_gwas",
+                       all.x = TRUE, # Keep all instruments, even if N is not found (N will be NA)
+                       sort = FALSE) 
+                       
+  if (nrow(merged_data) != nrow(summary_subset)) {
+    warning(paste("Number of rows changed after merging with GWAS data for", exposure_name,
+                  ". This might indicate duplicate rsIDs in the GWAS file or other merge issues."))
+  }
+  
+  # Check for SNPs where N was not found
+  if (any(is.na(merged_data$N))) {
+    missing_n_snps <- merged_data[is.na(N), rsID]
+    warning(paste("N not found in GWAS summary for", length(missing_n_snps), "SNPs for exposure", exposure_name,
+                  ". SNPs:", paste(head(missing_n_snps), collapse=", "), if(length(missing_n_snps) > 5) "..." ))
+  }
+  
+  # Add exposure name column
+  merged_data[, Exposure := exposure_name]
+  
+  # Reorder columns to desired output
+  final_data <- merged_data[, .(Exposure, rsID, EA, NEA, EAF, Beta, SE, pval,N)]
+  
+  return(final_data)
+}
+```
+
+```{r}
+#Run for all the UKB instrument_tsvs
+ukb_instrument_details <- map(ukb_instrument_tsvs, ~process_instrument_file(.)) %>% bind_rows() %>%
+  mutate(Exposure = ifelse(Exposure =='hcm', 'HCM', Exposure))
+
+#And so for HCMR instrument_details
+hcmr_instrument_details <- map(hcmr_instrument_tsvs, ~process_instrument_file(.)) %>% bind_rows() %>%
+  mutate(Exposure = case_when(Exposure =='hcm'~'HCM', 
+                              Exposure == 'mmp1' ~ 'MMP1',
+                              Exposure =='st2' ~ 'IL1RL1',
+                              Exposure == 'TnTStat' ~ 'TnT',
+                              T~Exposure))
+  
+
+#Write out .tsv files
+write_tsv(ukb_instrument_details, str_c(results_folder,'ukb_MR_instrument_details_supptable.tsv'))
+write_tsv(hcmr_instrument_details, str_c(results_folder,'hcmr_MR_instrument_details_supptable.tsv'))
+```
+
