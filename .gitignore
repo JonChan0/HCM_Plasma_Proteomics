@@ -70,4 +70,6 @@ EV/*
 
 ML/archive/*
 
+#This is folders relating to the ukb_git_audit_tool.exe
 *.exe
+HCM_Plasma_Proteomics/
